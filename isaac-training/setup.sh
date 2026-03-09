@@ -34,6 +34,8 @@ pip install moviepy==1.0.3
 pip install pyyaml
 pip install rospkg
 pip install matplotlib
+pip install -U pip==21.2
+pip install -U setuptools==75
 
 # Step 2: Install dependencies
 echo "Installing system dependencies..."

@@ -73,7 +73,7 @@ def _get_pytorch_version(is_nightly):
     #     return f"torch=={os.environ['PYTORCH_VERSION']}"
     if is_nightly:
         return "torch>=2.2.0.dev"
-    return "torch>=2.1.0"
+    return "torch>=2.0.1"
 
 
 def _get_packages():

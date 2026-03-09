@@ -4,7 +4,7 @@ defaults:
   - ppo
   - sim
 
-headless: False
+headless: True
 device: "cuda:0"
 seed: 0
 
@@ -32,7 +32,7 @@ viewer:
 
 wandb:
   project: NavRL
-  name: navigation_training
-  entity: CERLAB-UAV-RL-Navigation
-  mode: offline # online
+  name: navigation_training_5060ti
+  entity: anthonyshen730-carnegie-mellon-university
+  mode: online # online
   run_id: #kw9xf9k9
