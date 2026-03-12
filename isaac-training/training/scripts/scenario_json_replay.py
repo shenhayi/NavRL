@@ -12,6 +12,11 @@ Example:
     /home/haoyus/projects/NavRL/NavRL-code/NavRL/isaac-training/training/scripts/scenario_json_replay.py \
     --json /abs/path/to/scenario_data.json
 
+  /home/haoyus/projects/NavRL/isaac-sim/python.sh \
+    /home/haoyus/projects/NavRL/NavRL-code/NavRL/isaac-training/training/scripts/scenario_json_replay.py \
+    --config /home/haoyus/projects/NavRL/NavRL-code/NavRL/isaac-training/training/cfg/train.yaml \
+    --json /abs/path/to/scenario_data.json
+
 Notes:
 - Tested for the NavRL layout that vendors OmniDrones and Orbit under `isaac-training/third_party`.
 - The script uses the same Hummingbird multirotor class NavRL trains with by default.
@@ -50,32 +55,149 @@ for ext_dir in ORBIT_SOURCE_DIR.glob("extensions/*"):
         sys.path.insert(0, path_str)
 
 
-def parse_args() -> argparse.Namespace:
+DEFAULT_ARGS = {
+    "config": None,
+    "json": None,
+    "headless": False,
+    "speed": 1.0,
+    "loop": False,
+    "drone_model": "Hummingbird",
+    "sim_dt": 0.01,
+    "ground_size": 120.0,
+    "camera_eye": (18.0, -18.0, 16.0),
+    "camera_lookat": (0.0, 0.0, 0.0),
+    "save_stage": None,
+    "record": False,
+    "record_every": 2,
+    "video_tag": "recording",
+    "video_output": None,
+    "wandb": False,
+    "wandb_project": "omnidrones",
+    "wandb_entity": None,
+    "wandb_name": None,
+    "wandb_mode": "online",
+    "wandb_run_id": None,
+    "device": None,
+}
+DEFAULT_REPLAY_CONFIG = TRAINING_DIR / "cfg" / "replay.yaml"
+
+
+def load_runtime_config(config_path: Path) -> dict:
+    try:
+        from hydra import compose, initialize_config_dir
+        from omegaconf import OmegaConf
+    except ImportError as exc:
+        raise RuntimeError("Hydra/OmegaConf is required to load replay config files.") from exc
+
+    resolved_path = config_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        raise FileNotFoundError(f"Config file not found: {resolved_path}")
+
+    with initialize_config_dir(config_dir=str(resolved_path.parent), version_base=None):
+        cfg = compose(config_name=resolved_path.stem)
+    return OmegaConf.to_container(cfg, resolve=True)
+
+
+def get_nested(mapping: dict, *keys: str):
+    value = mapping
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+        if value is None:
+            return None
+    return value
+
+
+def first_non_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def config_arg_defaults(config: dict) -> dict:
+    replay_cfg = get_nested(config, "replay") or {}
+
+    return {
+        "json": first_non_none(replay_cfg.get("json"), config.get("json")),
+        "headless": first_non_none(replay_cfg.get("headless"), config.get("headless")),
+        "speed": replay_cfg.get("speed"),
+        "loop": replay_cfg.get("loop"),
+        "drone_model": first_non_none(replay_cfg.get("drone_model"), get_nested(config, "drone", "model_name")),
+        "sim_dt": first_non_none(replay_cfg.get("sim_dt"), get_nested(config, "sim", "dt")),
+        "ground_size": replay_cfg.get("ground_size"),
+        "camera_eye": first_non_none(replay_cfg.get("camera_eye"), get_nested(config, "viewer", "eye")),
+        "camera_lookat": first_non_none(replay_cfg.get("camera_lookat"), get_nested(config, "viewer", "lookat")),
+        "save_stage": replay_cfg.get("save_stage"),
+        "record": replay_cfg.get("record"),
+        "record_every": replay_cfg.get("record_every"),
+        "video_tag": replay_cfg.get("video_tag"),
+        "video_output": replay_cfg.get("video_output"),
+        "wandb": replay_cfg.get("wandb"),
+        "wandb_project": first_non_none(replay_cfg.get("wandb_project"), get_nested(config, "wandb", "project")),
+        "wandb_entity": first_non_none(replay_cfg.get("wandb_entity"), get_nested(config, "wandb", "entity")),
+        "wandb_name": first_non_none(replay_cfg.get("wandb_name"), get_nested(config, "wandb", "name")),
+        "wandb_mode": first_non_none(replay_cfg.get("wandb_mode"), get_nested(config, "wandb", "mode")),
+        "wandb_run_id": first_non_none(replay_cfg.get("wandb_run_id"), get_nested(config, "wandb", "run_id")),
+        "device": first_non_none(replay_cfg.get("device"), config.get("device"), get_nested(config, "sim", "device")),
+    }
+
+
+def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Replay Primitive-Planner scenario_data.json with NavRL OmniDrones",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--json", required=True, help="Path to scenario_data.json")
-    parser.add_argument("--headless", action="store_true", help="Run headless")
-    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier")
-    parser.add_argument("--loop", action="store_true", help="Loop playback")
-    parser.add_argument("--drone-model", type=str, default="Hummingbird", help="OmniDrones multirotor model")
-    parser.add_argument("--sim-dt", type=float, default=0.01, help="Physics and rendering dt")
-    parser.add_argument("--ground-size", type=float, default=120.0, help="Ground plane size in meters")
-    parser.add_argument("--camera-eye", nargs=3, type=float, default=(18.0, -18.0, 16.0), help="Viewer camera eye")
-    parser.add_argument("--camera-lookat", nargs=3, type=float, default=(0.0, 0.0, 0.0), help="Viewer camera look-at")
-    parser.add_argument("--save-stage", type=str, default=None, help="Optional .usd/.usda path to save generated stage")
-    parser.add_argument("--record", action="store_true", help="Capture viewport frames during replay")
-    parser.add_argument("--record-every", type=int, default=2, help="Capture every N sim steps")
-    parser.add_argument("--video-tag", type=str, default="recording", help="WandB/local video tag")
-    parser.add_argument("--video-output", type=str, default=None, help="Optional local mp4 output path")
-    parser.add_argument("--wandb", action="store_true", help="Log replay metadata and video to Weights & Biases")
-    parser.add_argument("--wandb-project", type=str, default="omnidrones", help="WandB project name")
-    parser.add_argument("--wandb-entity", type=str, default=None, help="WandB entity")
-    parser.add_argument("--wandb-name", type=str, default=None, help="WandB run name")
-    parser.add_argument("--wandb-mode", type=str, default="online", choices=("online", "offline", "disabled"), help="WandB logging mode")
-    parser.add_argument("--wandb-run-id", type=str, default=None, help="Optional WandB run id to resume")
-    return parser.parse_args()
+    parser.add_argument("--config", type=str, default=defaults["config"], help="Optional YAML/Hydra config file, for example training/cfg/train.yaml")
+    parser.add_argument("--json", type=str, default=defaults["json"], help="Path to scenario_data.json")
+    parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=defaults["headless"], help="Run headless")
+    parser.add_argument("--speed", type=float, default=defaults["speed"], help="Playback speed multiplier")
+    parser.add_argument("--loop", action=argparse.BooleanOptionalAction, default=defaults["loop"], help="Loop playback")
+    parser.add_argument("--drone-model", type=str, default=defaults["drone_model"], help="OmniDrones multirotor model")
+    parser.add_argument("--sim-dt", type=float, default=defaults["sim_dt"], help="Physics and rendering dt")
+    parser.add_argument("--device", type=str, default=defaults["device"], help="Simulation device. Defaults to config value, otherwise auto-detect.")
+    parser.add_argument("--ground-size", type=float, default=defaults["ground_size"], help="Ground plane size in meters")
+    parser.add_argument("--camera-eye", nargs=3, type=float, default=defaults["camera_eye"], help="Viewer camera eye")
+    parser.add_argument("--camera-lookat", nargs=3, type=float, default=defaults["camera_lookat"], help="Viewer camera look-at")
+    parser.add_argument("--save-stage", type=str, default=defaults["save_stage"], help="Optional .usd/.usda path to save generated stage")
+    parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=defaults["record"], help="Capture viewport frames during replay")
+    parser.add_argument("--record-every", type=int, default=defaults["record_every"], help="Capture every N sim steps")
+    parser.add_argument("--video-tag", type=str, default=defaults["video_tag"], help="WandB/local video tag")
+    parser.add_argument("--video-output", type=str, default=defaults["video_output"], help="Optional local mp4 output path")
+    parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=defaults["wandb"], help="Log replay metadata and video to Weights & Biases")
+    parser.add_argument("--wandb-project", type=str, default=defaults["wandb_project"], help="WandB project name")
+    parser.add_argument("--wandb-entity", type=str, default=defaults["wandb_entity"], help="WandB entity")
+    parser.add_argument("--wandb-name", type=str, default=defaults["wandb_name"], help="WandB run name")
+    parser.add_argument("--wandb-mode", type=str, default=defaults["wandb_mode"], choices=("online", "offline", "disabled"), help="WandB logging mode")
+    parser.add_argument("--wandb-run-id", type=str, default=defaults["wandb_run_id"], help="Optional WandB run id to resume")
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument(
+        "--config",
+        type=str,
+        default=str(DEFAULT_REPLAY_CONFIG) if DEFAULT_REPLAY_CONFIG.is_file() else None,
+    )
+    bootstrap_args, _ = bootstrap_parser.parse_known_args()
+
+    defaults = DEFAULT_ARGS.copy()
+    if bootstrap_args.config is not None:
+        config_path = Path(bootstrap_args.config)
+        defaults.update({k: v for k, v in config_arg_defaults(load_runtime_config(config_path)).items() if v is not None})
+        defaults["config"] = str(config_path.expanduser().resolve())
+
+    parser = build_parser(defaults)
+    args = parser.parse_args()
+    if args.json is None:
+        parser.error("Scenario JSON path is required. Pass --json or set replay.json/json in --config.")
+    if len(args.camera_eye) != 3:
+        parser.error("--camera-eye must have exactly 3 values.")
+    if len(args.camera_lookat) != 3:
+        parser.error("--camera-lookat must have exactly 3 values.")
+    return args
 
 
 def load_scenario(json_path: Path) -> dict:
@@ -112,6 +234,28 @@ def scenario_duration(drones: list[dict]) -> float:
     return max(duration, 0.1)
 
 
+def resolve_sim_device(requested_device: str | None) -> str:
+    if requested_device is None:
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"Requested device '{requested_device}' but CUDA is unavailable; falling back to cpu.")
+        return "cpu"
+    return requested_device
+
+
+def resolve_drone_model_name(requested_name: str, registry: dict) -> str:
+    if requested_name in registry:
+        return requested_name
+
+    normalized = requested_name.lower()
+    for model_name in registry:
+        if model_name.lower() == normalized:
+            return model_name
+
+    available = ", ".join(sorted(registry))
+    raise KeyError(f"Unknown drone model '{requested_name}'. Available models: {available}")
+
+
 def main() -> None:
     args = parse_args()
     scenario_path = Path(args.json).expanduser().resolve()
@@ -140,6 +284,9 @@ def main() -> None:
         from omni_drones.utils.torch import euler_to_quaternion
         from pxr import Gf, Sdf, UsdGeom, UsdShade
 
+        args.drone_model = resolve_drone_model_name(args.drone_model, MultirotorBase.REGISTRY)
+        sim_device = resolve_sim_device(args.device)
+
         wandb_run = None
         if args.wandb:
             import datetime
@@ -157,6 +304,7 @@ def main() -> None:
                     "loop": args.loop,
                     "drone_model": args.drone_model,
                     "sim_dt": args.sim_dt,
+                    "device": sim_device,
                     "record": args.record,
                     "record_every": args.record_every,
                 },
@@ -171,7 +319,7 @@ def main() -> None:
             physics_dt=args.sim_dt,
             rendering_dt=args.sim_dt,
             backend="torch",
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device=sim_device,
         )
         stage = sim.stage
         sim_utils.GroundPlaneCfg(color=(0.1, 0.1, 0.1), size=(args.ground_size, args.ground_size)).func(
@@ -290,6 +438,8 @@ def main() -> None:
 
         total_duration = scenario_duration(drones_with_traj)
         print(f"Loaded scenario: {scenario_path}")
+        if args.config:
+            print(f"Loaded replay defaults from config: {Path(args.config).expanduser().resolve()}")
         print(f"Replaying {n} drones with total duration {total_duration:.2f}s at speed {args.speed:.2f}x")
 
         start_wall = time.perf_counter()

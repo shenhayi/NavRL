@@ -1,0 +1,35 @@
+defaults:
+  - _self_
+  - drone
+  - sim
+
+headless: false
+device: "cuda:0"
+
+viewer:
+  eye: [18.0, -18.0, 16.0]
+  lookat: [0.0, 0.0, 0.0]
+  resolution: [960, 720]
+
+wandb:
+  project: NavRL
+  name: scenario_replay
+  entity: anthonyshen730-carnegie-mellon-university
+  mode: online
+  run_id:
+
+replay:
+  # Replace with your scenario_data.json path.
+  json: /abs/path/to/scenario_data.json
+  headless: false
+  speed: 1.0
+  loop: false
+  drone_model: Hummingbird
+  sim_dt: 0.01
+  ground_size: 120.0
+  record: true
+  record_every: 1
+  video_tag: recording
+  video_output:
+  save_stage:
+  wandb: true
