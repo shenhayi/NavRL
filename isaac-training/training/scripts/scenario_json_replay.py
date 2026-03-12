@@ -27,9 +27,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -64,14 +66,18 @@ DEFAULT_ARGS = {
     "drone_model": "Hummingbird",
     "sim_dt": 0.01,
     "ground_size": 120.0,
-    "camera_eye": (18.0, -18.0, 16.0),
-    "camera_lookat": (0.0, 0.0, 0.0),
-    "resolution": (960, 720),
+    "camera_eye": (0.0, 2.5, 24.0),
+    "camera_lookat": (0.0, 2.5, 0.0),
+    "resolution": (2560, 1440),
     "save_stage": None,
     "record": False,
     "record_every": 2,
     "video_tag": "recording",
     "video_output": None,
+    "video_crf": 12,
+    "video_preset": "slow",
+    "backup": False,
+    "backup_dir": str(TRAINING_DIR / "replay_outputs"),
     "wandb": False,
     "wandb_project": "omnidrones",
     "wandb_entity": None,
@@ -137,6 +143,10 @@ def config_arg_defaults(config: dict) -> dict:
         "record_every": replay_cfg.get("record_every"),
         "video_tag": replay_cfg.get("video_tag"),
         "video_output": replay_cfg.get("video_output"),
+        "video_crf": replay_cfg.get("video_crf"),
+        "video_preset": replay_cfg.get("video_preset"),
+        "backup": replay_cfg.get("backup"),
+        "backup_dir": replay_cfg.get("backup_dir"),
         "wandb": replay_cfg.get("wandb"),
         "wandb_project": first_non_none(replay_cfg.get("wandb_project"), get_nested(config, "wandb", "project")),
         "wandb_entity": first_non_none(replay_cfg.get("wandb_entity"), get_nested(config, "wandb", "entity")),
@@ -170,6 +180,10 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--record-every", type=int, default=defaults["record_every"], help="Capture every N sim steps")
     parser.add_argument("--video-tag", type=str, default=defaults["video_tag"], help="WandB/local video tag")
     parser.add_argument("--video-output", type=str, default=defaults["video_output"], help="Optional local mp4 output path")
+    parser.add_argument("--video-crf", type=int, default=defaults["video_crf"], help="MP4 quality setting for libx264. Lower is higher quality.")
+    parser.add_argument("--video-preset", type=str, default=defaults["video_preset"], help="FFmpeg/libx264 preset used for exported video.")
+    parser.add_argument("--backup", action=argparse.BooleanOptionalAction, default=defaults["backup"], help="Write a per-run local backup folder with video and metadata.")
+    parser.add_argument("--backup-dir", type=str, default=defaults["backup_dir"], help="Directory used for replay backups.")
     parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=defaults["wandb"], help="Log replay metadata and video to Weights & Biases")
     parser.add_argument("--wandb-project", type=str, default=defaults["wandb_project"], help="WandB project name")
     parser.add_argument("--wandb-entity", type=str, default=defaults["wandb_entity"], help="WandB entity")
@@ -271,6 +285,87 @@ def extract_rgb_frame(rgb_annotator) -> np.ndarray | None:
     return np.ascontiguousarray(frame[..., :3])
 
 
+def build_wandb_run_name(base_name: str | None) -> str:
+    timestamp = datetime.datetime.now().strftime("%m-%d_%H-%M")
+    prefix = base_name or "scenario_replay"
+    return f"{prefix}_{timestamp}"
+
+
+def prepare_backup_dir(args: argparse.Namespace, run_name: str) -> Path | None:
+    if not args.backup:
+        return None
+    backup_root = Path(args.backup_dir).expanduser().resolve()
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_root / run_name
+    backup_path.mkdir(parents=True, exist_ok=True)
+    return backup_path
+
+
+def resolve_primary_output_dir(wandb_run, backup_dir: Path | None) -> Path | None:
+    if wandb_run is not None:
+        return Path(wandb_run.dir).resolve()
+    return backup_dir
+
+
+def resolve_video_output_path(
+    args: argparse.Namespace,
+    wandb_run,
+    scenario_path: Path,
+    backup_dir: Path | None,
+) -> Path | None:
+    if not args.record:
+        return None
+    if args.video_output:
+        return Path(args.video_output).expanduser().resolve()
+    output_dir = resolve_primary_output_dir(wandb_run, backup_dir)
+    if output_dir is not None:
+        return output_dir / f"{scenario_path.stem.replace(' ', '_')}_replay.mp4"
+    return None
+
+
+def write_run_metadata(
+    output_dir: Path | None,
+    run_name: str,
+    scenario_path: Path,
+    args: argparse.Namespace,
+    total_duration: float,
+    num_drones: int,
+    video_path: Path | None,
+) -> None:
+    if output_dir is None:
+        return
+    metadata = {
+        "run_name": run_name,
+        "scenario_json": str(scenario_path),
+        "config": args.config,
+        "headless": args.headless,
+        "speed": args.speed,
+        "loop": args.loop,
+        "drone_model": args.drone_model,
+        "sim_dt": args.sim_dt,
+        "device": args.device,
+        "camera_eye": list(args.camera_eye),
+        "camera_lookat": list(args.camera_lookat),
+        "resolution": list(args.resolution),
+        "record": args.record,
+        "record_every": args.record_every,
+        "video_tag": args.video_tag,
+        "video_output": str(video_path) if video_path is not None else None,
+        "video_crf": args.video_crf,
+        "video_preset": args.video_preset,
+        "wandb": args.wandb,
+        "wandb_project": args.wandb_project,
+        "wandb_entity": args.wandb_entity,
+        "wandb_mode": args.wandb_mode,
+        "scenario_duration": total_duration,
+        "num_drones": num_drones,
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    metadata_path = output_dir / "metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
 def main() -> None:
     args = parse_args()
     scenario_path = Path(args.json).expanduser().resolve()
@@ -297,7 +392,7 @@ def main() -> None:
         from omni_drones.controllers import LeePositionController
         from omni_drones.robots.drone import MultirotorBase
         from omni_drones.utils.torch import euler_to_quaternion
-        from pxr import Gf, Sdf, UsdGeom, UsdShade
+        from pxr import UsdGeom
 
         if args.record or not args.headless:
             enable_extension("omni.kit.viewport.rtx")
@@ -308,13 +403,13 @@ def main() -> None:
 
         args.drone_model = resolve_drone_model_name(args.drone_model, MultirotorBase.REGISTRY)
         sim_device = resolve_sim_device(args.device)
+        run_name = build_wandb_run_name(args.wandb_name)
+        backup_dir = prepare_backup_dir(args, run_name)
 
         wandb_run = None
         if args.wandb:
-            import datetime
             import wandb
 
-            run_name = args.wandb_name or f"scenario-replay/{datetime.datetime.now().strftime('%m-%d_%H-%M')}"
             init_kwargs = {
                 "project": args.wandb_project,
                 "entity": args.wandb_entity,
@@ -329,6 +424,9 @@ def main() -> None:
                     "device": sim_device,
                     "record": args.record,
                     "record_every": args.record_every,
+                    "resolution": list(args.resolution),
+                    "video_crf": args.video_crf,
+                    "video_preset": args.video_preset,
                 },
             }
             if args.wandb_run_id is not None:
@@ -354,26 +452,6 @@ def main() -> None:
             "/World/SkyLight", sim_utils.DomeLightCfg(color=(0.25, 0.25, 0.30), intensity=1500.0)
         )
 
-        UsdGeom.Scope.Define(stage, "/World/Looks")
-
-        def ensure_material(name: str, rgb: tuple[float, float, float], opacity: float = 1.0) -> str:
-            material_path = f"/World/Looks/{name}"
-            material = UsdShade.Material.Define(stage, material_path)
-            shader = UsdShade.Shader.Define(stage, f"{material_path}/Shader")
-            shader.CreateIdAttr("UsdPreviewSurface")
-            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
-            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.05)
-            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
-            shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(opacity)
-            material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-            return material_path
-
-        obstacle_material_path = ensure_material("Obstacle", (0.90, 0.73, 0.22), opacity=0.55)
-
-        def bind_material(prim, material_path: str) -> None:
-            material = UsdShade.Material.Get(stage, material_path)
-            UsdShade.MaterialBindingAPI(prim).Bind(material)
-
         stage.DefinePrim("/World/Scenario", "Xform")
         stage.DefinePrim("/World/Scenario/Obstacles", "Xform")
 
@@ -381,16 +459,24 @@ def main() -> None:
             if obs.get("type") != "box":
                 continue
             prim_path = f"/World/Scenario/Obstacles/Obstacle_{idx:03d}"
-            cube = UsdGeom.Cube.Define(stage, prim_path)
-            cube.CreateSizeAttr(1.0)
-            xform = UsdGeom.XformCommonAPI(cube)
-            xform.SetTranslate((float(obs["x"]), float(obs["y"]), float(obs["z"])))
-            xform.SetRotate(
-                (0.0, 0.0, math.degrees(float(obs.get("yaw", 0.0)))),
-                UsdGeom.XformCommonAPI.RotationOrderXYZ,
+            yaw = float(obs.get("yaw", 0.0))
+            obstacle_cfg = sim_utils.CuboidCfg(
+                size=(float(obs["size_x"]), float(obs["size_y"]), float(obs["size_z"])),
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(0.90, 0.73, 0.22),
+                    emissive_color=(0.08, 0.06, 0.02),
+                    roughness=0.35,
+                    metallic=0.05,
+                    opacity=0.55,
+                ),
             )
-            xform.SetScale((float(obs["size_x"]), float(obs["size_y"]), float(obs["size_z"])))
-            bind_material(cube.GetPrim(), obstacle_material_path)
+            obstacle_cfg.func(
+                prim_path,
+                obstacle_cfg,
+                translation=(float(obs["x"]), float(obs["y"]), float(obs["z"])),
+                orientation=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
+            )
 
         drones_with_traj = [d for d in scenario.get("drones", []) if d.get("trajectory")]
         if not drones_with_traj:
@@ -460,9 +546,15 @@ def main() -> None:
             print(f"Saved generated stage to {save_path}")
 
         total_duration = scenario_duration(drones_with_traj)
+        output_dir = resolve_primary_output_dir(wandb_run, backup_dir)
+        video_path = resolve_video_output_path(args, wandb_run, scenario_path, backup_dir)
         print(f"Loaded scenario: {scenario_path}")
         if args.config:
             print(f"Loaded replay defaults from config: {Path(args.config).expanduser().resolve()}")
+        if output_dir is not None:
+            print(f"Primary run output: {output_dir}")
+        if backup_dir is not None:
+            print(f"Local replay backup: {backup_dir}")
         print(f"Replaying {n} drones with total duration {total_duration:.2f}s at speed {args.speed:.2f}x")
         sim.play()
 
@@ -510,22 +602,37 @@ def main() -> None:
             frames = torch.from_numpy(frames_np.copy())
             fps = max(1, int(round(1.0 / (args.sim_dt * max(1, args.record_every)))))
             print(f"Captured {len(captured_frames)} frames at resolution {frames_np.shape[2]}x{frames_np.shape[1]}.")
-            if args.video_output:
+            if video_path is not None:
                 from torchvision.io import write_video
 
-                video_path = str(Path(args.video_output).expanduser().resolve())
-                write_video(video_path, frames, fps=fps)
+                write_video(
+                    str(video_path),
+                    frames,
+                    fps=fps,
+                    video_codec="libx264",
+                    options={
+                        "crf": str(args.video_crf),
+                        "preset": args.video_preset,
+                        "pix_fmt": "yuv420p",
+                    },
+                )
                 print(f"Saved replay video to {video_path}")
+                if backup_dir is not None and video_path.parent != backup_dir:
+                    backup_video_path = backup_dir / video_path.name
+                    shutil.copy2(video_path, backup_video_path)
+                    print(f"Copied replay video backup to {backup_video_path}")
             if wandb_run is not None:
                 import wandb
 
-                wandb_run.log(
-                    {
-                        "scenario_duration": total_duration,
-                        "num_drones": n,
-                        args.video_tag: wandb.Video(np.transpose(frames_np, (0, 3, 1, 2)), fps=fps, format="mp4"),
-                    }
+                video_value = (
+                    wandb.Video(str(video_path), fps=fps, format="mp4")
+                    if video_path is not None
+                    else wandb.Video(np.transpose(frames_np, (0, 3, 1, 2)), fps=fps, format="mp4")
                 )
+                wandb_run.log({"scenario_duration": total_duration, "num_drones": n, args.video_tag: video_value})
+            write_run_metadata(output_dir, run_name, scenario_path, args, total_duration, n, video_path)
+            if backup_dir is not None and backup_dir != output_dir:
+                write_run_metadata(backup_dir, run_name, scenario_path, args, total_duration, n, video_path)
         elif wandb_run is not None:
             if args.record:
                 print("Recording was enabled, but no frames were captured.")
@@ -535,6 +642,11 @@ def main() -> None:
                     "num_drones": n,
                 }
             )
+            write_run_metadata(output_dir, run_name, scenario_path, args, total_duration, n, video_path)
+            if backup_dir is not None and backup_dir != output_dir:
+                write_run_metadata(backup_dir, run_name, scenario_path, args, total_duration, n, video_path)
+        else:
+            write_run_metadata(output_dir, run_name, scenario_path, args, total_duration, n, video_path)
 
     finally:
         try:
