@@ -60,6 +60,7 @@ DEFAULT_ARGS = {
     "headless": False,
     "speed": 1.0,
     "loop": False,
+    "anti_aliasing": 4,
     "drone_model": "Hummingbird",
     "sim_dt": 0.01,
     "ground_size": 120.0,
@@ -124,6 +125,7 @@ def config_arg_defaults(config: dict) -> dict:
         "headless": first_non_none(replay_cfg.get("headless"), config.get("headless")),
         "speed": replay_cfg.get("speed"),
         "loop": replay_cfg.get("loop"),
+        "anti_aliasing": first_non_none(replay_cfg.get("anti_aliasing"), get_nested(config, "viewer", "anti_aliasing")),
         "drone_model": first_non_none(replay_cfg.get("drone_model"), get_nested(config, "drone", "model_name")),
         "sim_dt": first_non_none(replay_cfg.get("sim_dt"), get_nested(config, "sim", "dt")),
         "ground_size": replay_cfg.get("ground_size"),
@@ -155,6 +157,7 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--headless", action=argparse.BooleanOptionalAction, default=defaults["headless"], help="Run headless")
     parser.add_argument("--speed", type=float, default=defaults["speed"], help="Playback speed multiplier")
     parser.add_argument("--loop", action=argparse.BooleanOptionalAction, default=defaults["loop"], help="Loop playback")
+    parser.add_argument("--anti-aliasing", type=int, default=defaults["anti_aliasing"], help="Viewport anti-aliasing level")
     parser.add_argument("--drone-model", type=str, default=defaults["drone_model"], help="OmniDrones multirotor model")
     parser.add_argument("--sim-dt", type=float, default=defaults["sim_dt"], help="Physics and rendering dt")
     parser.add_argument("--device", type=str, default=defaults["device"], help="Simulation device. Defaults to config value, otherwise auto-detect.")
@@ -280,9 +283,9 @@ def main() -> None:
         app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.kit"
 
     simulation_app = (
-        SimulationApp({"headless": args.headless, "anti_aliasing": 1}, experience=app_experience)
+        SimulationApp({"headless": args.headless, "anti_aliasing": args.anti_aliasing}, experience=app_experience)
         if app_experience
-        else SimulationApp({"headless": args.headless, "anti_aliasing": 1})
+        else SimulationApp({"headless": args.headless, "anti_aliasing": args.anti_aliasing})
     )
 
     try:
@@ -353,17 +356,19 @@ def main() -> None:
 
         UsdGeom.Scope.Define(stage, "/World/Looks")
 
-        def ensure_material(name: str, rgb: tuple[float, float, float]) -> str:
+        def ensure_material(name: str, rgb: tuple[float, float, float], opacity: float = 1.0) -> str:
             material_path = f"/World/Looks/{name}"
             material = UsdShade.Material.Define(stage, material_path)
             shader = UsdShade.Shader.Define(stage, f"{material_path}/Shader")
             shader.CreateIdAttr("UsdPreviewSurface")
             shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*rgb))
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.05)
             shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.45)
+            shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(opacity)
             material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
             return material_path
 
-        obstacle_material_path = ensure_material("Obstacle", (0.35, 0.35, 0.38))
+        obstacle_material_path = ensure_material("Obstacle", (0.90, 0.73, 0.22), opacity=0.55)
 
         def bind_material(prim, material_path: str) -> None:
             material = UsdShade.Material.Get(stage, material_path)
