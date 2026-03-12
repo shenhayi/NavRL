@@ -20,7 +20,7 @@ Example:
 Notes:
 - Tested for the NavRL layout that vendors OmniDrones and Orbit under `isaac-training/third_party`.
 - The script uses the same Hummingbird multirotor class NavRL trains with by default.
-- Obstacles are visualized as static USD cubes; drones are physically simulated and
+- Obstacles are visualized as static cuboids; drones are physically simulated and
   commanded to track the reference path.
 """
 
@@ -65,6 +65,9 @@ DEFAULT_ARGS = {
     "drone_model": "Hummingbird",
     "sim_dt": 0.01,
     "ground_size": 120.0,
+    "camera_mode": "fit_topdown",
+    "camera_margin": 1.12,
+    "camera_fov_deg": 60.0,
     "camera_eye": (0.0, 2.5, 24.0),
     "camera_lookat": (0.0, 2.5, 0.0),
     "resolution": (2560, 1440),
@@ -132,6 +135,9 @@ def config_arg_defaults(config: dict) -> dict:
         "drone_model": first_non_none(replay_cfg.get("drone_model"), get_nested(config, "drone", "model_name")),
         "sim_dt": first_non_none(replay_cfg.get("sim_dt"), get_nested(config, "sim", "dt")),
         "ground_size": replay_cfg.get("ground_size"),
+        "camera_mode": replay_cfg.get("camera_mode"),
+        "camera_margin": replay_cfg.get("camera_margin"),
+        "camera_fov_deg": replay_cfg.get("camera_fov_deg"),
         "camera_eye": first_non_none(replay_cfg.get("camera_eye"), get_nested(config, "viewer", "eye")),
         "camera_lookat": first_non_none(replay_cfg.get("camera_lookat"), get_nested(config, "viewer", "lookat")),
         "resolution": first_non_none(replay_cfg.get("resolution"), get_nested(config, "viewer", "resolution")),
@@ -167,6 +173,9 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--sim-dt", type=float, default=defaults["sim_dt"], help="Physics and rendering dt")
     parser.add_argument("--device", type=str, default=defaults["device"], help="Simulation device. Defaults to config value, otherwise auto-detect.")
     parser.add_argument("--ground-size", type=float, default=defaults["ground_size"], help="Ground plane size in meters")
+    parser.add_argument("--camera-mode", type=str, default=defaults["camera_mode"], choices=("fit_topdown", "manual"), help="Use an automatic top-down scene fit or the manual camera coordinates below")
+    parser.add_argument("--camera-margin", type=float, default=defaults["camera_margin"], help="Extra margin applied when fitting the top-down camera")
+    parser.add_argument("--camera-fov-deg", type=float, default=defaults["camera_fov_deg"], help="Vertical camera field of view used for top-down fitting")
     parser.add_argument("--camera-eye", nargs=3, type=float, default=defaults["camera_eye"], help="Viewer camera eye")
     parser.add_argument("--camera-lookat", nargs=3, type=float, default=defaults["camera_lookat"], help="Viewer camera look-at")
     parser.add_argument("--resolution", nargs=2, type=int, default=defaults["resolution"], help="Render/video resolution")
@@ -211,6 +220,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--camera-lookat must have exactly 3 values.")
     if len(args.resolution) != 2:
         parser.error("--resolution must have exactly 2 values.")
+    if args.camera_margin <= 0.0:
+        parser.error("--camera-margin must be positive.")
+    if not 1.0 < args.camera_fov_deg < 179.0:
+        parser.error("--camera-fov-deg must be between 1 and 179.")
     return args
 
 
@@ -284,6 +297,68 @@ def build_wandb_run_name(base_name: str | None) -> str:
     return f"{prefix}_{timestamp}"
 
 
+def compute_scene_bounds(scenario: dict, track_data: list[dict]) -> tuple[float, float, float, float, float]:
+    x_mins = []
+    x_maxs = []
+    y_mins = []
+    y_maxs = []
+    z_max = 0.0
+
+    for obs in scenario.get("obstacles", []):
+        if obs.get("type") != "box":
+            continue
+        x = float(obs["x"])
+        y = float(obs["y"])
+        z = float(obs["z"])
+        size_x = float(obs["size_x"])
+        size_y = float(obs["size_y"])
+        size_z = float(obs["size_z"])
+        yaw = float(obs.get("yaw", 0.0))
+        cos_yaw = abs(math.cos(yaw))
+        sin_yaw = abs(math.sin(yaw))
+        half_x = 0.5 * (cos_yaw * size_x + sin_yaw * size_y)
+        half_y = 0.5 * (sin_yaw * size_x + cos_yaw * size_y)
+        x_mins.append(x - half_x)
+        x_maxs.append(x + half_x)
+        y_mins.append(y - half_y)
+        y_maxs.append(y + half_y)
+        z_max = max(z_max, z + 0.5 * size_z)
+
+    for track in track_data:
+        positions = track["positions"]
+        if len(positions) == 0:
+            continue
+        x_mins.append(float(np.min(positions[:, 0])))
+        x_maxs.append(float(np.max(positions[:, 0])))
+        y_mins.append(float(np.min(positions[:, 1])))
+        y_maxs.append(float(np.max(positions[:, 1])))
+        z_max = max(z_max, float(np.max(positions[:, 2])))
+
+    if not x_mins:
+        return (-10.0, 10.0, -10.0, 10.0, 10.0)
+
+    return min(x_mins), max(x_maxs), min(y_mins), max(y_maxs), z_max
+
+
+def compute_camera_pose(
+    args: argparse.Namespace, scenario: dict, track_data: list[dict]
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    if args.camera_mode == "manual":
+        return tuple(args.camera_eye), tuple(args.camera_lookat)
+
+    x_min, x_max, y_min, y_max, z_max = compute_scene_bounds(scenario, track_data)
+    center_x = 0.5 * (x_min + x_max)
+    center_y = 0.5 * (y_min + y_max)
+    scene_width = max(1.0, x_max - x_min)
+    scene_height = max(1.0, y_max - y_min)
+    aspect = max(float(args.resolution[0]) / float(args.resolution[1]), 1e-6)
+    tan_half_fov = math.tan(math.radians(args.camera_fov_deg) * 0.5)
+    fit_height = 0.5 * scene_height / tan_half_fov
+    fit_width = 0.5 * scene_width / (aspect * tan_half_fov)
+    eye_z = max(max(fit_height, fit_width) * args.camera_margin, z_max + 6.0)
+    return (center_x, center_y, eye_z), (center_x, center_y, 0.0)
+
+
 def main() -> None:
     args = parse_args()
     scenario_path = Path(args.json).expanduser().resolve()
@@ -310,7 +385,6 @@ def main() -> None:
         from omni_drones.controllers import LeePositionController
         from omni_drones.robots.drone import MultirotorBase
         from omni_drones.utils.torch import euler_to_quaternion
-        from pxr import UsdGeom
 
         if args.record or not args.headless:
             enable_extension("omni.kit.viewport.rtx")
@@ -376,9 +450,13 @@ def main() -> None:
             if obs.get("type") != "box":
                 continue
             prim_path = f"/World/Scenario/Obstacles/Obstacle_{idx:03d}"
+            marker_path = f"/World/Scenario/Obstacles/ObstacleMarker_{idx:03d}"
             yaw = float(obs.get("yaw", 0.0))
+            size_x = float(obs["size_x"])
+            size_y = float(obs["size_y"])
+            size_z = float(obs["size_z"])
             obstacle_cfg = sim_utils.CuboidCfg(
-                size=(float(obs["size_x"]), float(obs["size_y"]), float(obs["size_z"])),
+                size=(size_x, size_y, size_z),
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
                 visual_material=sim_utils.PreviewSurfaceCfg(
                     diffuse_color=(0.90, 0.73, 0.22),
@@ -392,6 +470,23 @@ def main() -> None:
                 prim_path,
                 obstacle_cfg,
                 translation=(float(obs["x"]), float(obs["y"]), float(obs["z"])),
+                orientation=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
+            )
+            marker_cfg = sim_utils.CuboidCfg(
+                size=(size_x, size_y, 0.04),
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=(1.0, 0.42, 0.10),
+                    emissive_color=(0.30, 0.08, 0.02),
+                    roughness=0.15,
+                    metallic=0.0,
+                    opacity=1.0,
+                ),
+            )
+            marker_cfg.func(
+                marker_path,
+                marker_cfg,
+                translation=(float(obs["x"]), float(obs["y"]), 0.08),
                 orientation=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
             )
 
@@ -448,7 +543,8 @@ def main() -> None:
         render_product = None
         rgb_annotator = None
         captured_frames = []
-        set_camera_view(eye=args.camera_eye, target=args.camera_lookat)
+        camera_eye, camera_lookat = compute_camera_pose(args, scenario, track_data)
+        set_camera_view(eye=camera_eye, target=camera_lookat)
 
         if args.record:
             render_resolution = tuple(int(v) for v in args.resolution)
@@ -467,6 +563,12 @@ def main() -> None:
         if args.config:
             print(f"Loaded replay defaults from config: {Path(args.config).expanduser().resolve()}")
         print(f"Replaying {n} drones with total duration {total_duration:.2f}s at speed {args.speed:.2f}x")
+        print(
+            "Camera pose:"
+            f" mode={args.camera_mode}"
+            f" eye=({camera_eye[0]:.2f}, {camera_eye[1]:.2f}, {camera_eye[2]:.2f})"
+            f" lookat=({camera_lookat[0]:.2f}, {camera_lookat[1]:.2f}, {camera_lookat[2]:.2f})"
+        )
         sim.play()
 
         step_count = 0

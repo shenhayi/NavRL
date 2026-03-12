@@ -28,6 +28,9 @@ replay:
   drone_model: Hummingbird
   sim_dt: 0.01
   ground_size: 120.0
+  camera_mode: fit_topdown
+  camera_margin: 1.12
+  camera_fov_deg: 60.0
   record: true
   record_every: 1
   video_tag: recording
