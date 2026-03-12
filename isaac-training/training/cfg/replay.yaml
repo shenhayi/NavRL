@@ -34,7 +34,5 @@ replay:
   video_output:
   video_crf: 12
   video_preset: slow
-  backup: false
-  backup_dir: isaac-training/training/replay_outputs
   save_stage:
   wandb: true
