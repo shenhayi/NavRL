@@ -3,12 +3,12 @@ defaults:
   - drone
   - sim
 
-headless: false
+headless: true
 device: "cuda:0"
 
 viewer:
-  eye: [18.0, -18.0, 16.0]
-  lookat: [0.0, 0.0, 0.0]
+  eye: [0.0, 40.0, 40.0]
+  lookat: [0.0, 2.5, 0.0]
   resolution: [960, 720]
 
 wandb:
@@ -21,7 +21,7 @@ wandb:
 replay:
   # Replace with your scenario_data.json path.
   json: /abs/path/to/scenario_data.json
-  headless: false
+  headless: true
   speed: 1.0
   loop: false
   drone_model: Hummingbird

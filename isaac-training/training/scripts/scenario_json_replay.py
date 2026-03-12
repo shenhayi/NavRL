@@ -31,7 +31,6 @@ import json
 import math
 import os
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -66,6 +65,7 @@ DEFAULT_ARGS = {
     "ground_size": 120.0,
     "camera_eye": (18.0, -18.0, 16.0),
     "camera_lookat": (0.0, 0.0, 0.0),
+    "resolution": (960, 720),
     "save_stage": None,
     "record": False,
     "record_every": 2,
@@ -129,6 +129,7 @@ def config_arg_defaults(config: dict) -> dict:
         "ground_size": replay_cfg.get("ground_size"),
         "camera_eye": first_non_none(replay_cfg.get("camera_eye"), get_nested(config, "viewer", "eye")),
         "camera_lookat": first_non_none(replay_cfg.get("camera_lookat"), get_nested(config, "viewer", "lookat")),
+        "resolution": first_non_none(replay_cfg.get("resolution"), get_nested(config, "viewer", "resolution")),
         "save_stage": replay_cfg.get("save_stage"),
         "record": replay_cfg.get("record"),
         "record_every": replay_cfg.get("record_every"),
@@ -160,6 +161,7 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--ground-size", type=float, default=defaults["ground_size"], help="Ground plane size in meters")
     parser.add_argument("--camera-eye", nargs=3, type=float, default=defaults["camera_eye"], help="Viewer camera eye")
     parser.add_argument("--camera-lookat", nargs=3, type=float, default=defaults["camera_lookat"], help="Viewer camera look-at")
+    parser.add_argument("--resolution", nargs=2, type=int, default=defaults["resolution"], help="Render/video resolution")
     parser.add_argument("--save-stage", type=str, default=defaults["save_stage"], help="Optional .usd/.usda path to save generated stage")
     parser.add_argument("--record", action=argparse.BooleanOptionalAction, default=defaults["record"], help="Capture viewport frames during replay")
     parser.add_argument("--record-every", type=int, default=defaults["record_every"], help="Capture every N sim steps")
@@ -197,6 +199,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--camera-eye must have exactly 3 values.")
     if len(args.camera_lookat) != 3:
         parser.error("--camera-lookat must have exactly 3 values.")
+    if len(args.resolution) != 2:
+        parser.error("--resolution must have exactly 2 values.")
     return args
 
 
@@ -256,6 +260,14 @@ def resolve_drone_model_name(requested_name: str, registry: dict) -> str:
     raise KeyError(f"Unknown drone model '{requested_name}'. Available models: {available}")
 
 
+def extract_rgb_frame(rgb_annotator) -> np.ndarray | None:
+    rgb_data = rgb_annotator.get_data()
+    if rgb_data is None or not hasattr(rgb_data, "shape"):
+        return None
+    frame = np.frombuffer(rgb_data, dtype=np.uint8).reshape(*rgb_data.shape)
+    return np.ascontiguousarray(frame[..., :3])
+
+
 def main() -> None:
     args = parse_args()
     scenario_path = Path(args.json).expanduser().resolve()
@@ -277,12 +289,19 @@ def main() -> None:
         import omni
         import omni.isaac.orbit.sim as sim_utils
         from omni.isaac.core.simulation_context import SimulationContext
+        from omni.isaac.core.utils.extensions import enable_extension
         from omni.isaac.core.utils.viewports import set_camera_view
         from omni_drones.controllers import LeePositionController
         from omni_drones.robots.drone import MultirotorBase
-        from omni_drones.sensors.camera import Camera, PinholeCameraCfg
         from omni_drones.utils.torch import euler_to_quaternion
         from pxr import Gf, Sdf, UsdGeom, UsdShade
+
+        if args.record or not args.headless:
+            enable_extension("omni.kit.viewport.rtx")
+            enable_extension("omni.kit.viewport.pxr")
+            enable_extension("omni.kit.viewport.bundle")
+            enable_extension("omni.replicator.isaac")
+            import omni.replicator.core as rep
 
         args.drone_model = resolve_drone_model_name(args.drone_model, MultirotorBase.REGISTRY)
         sim_device = resolve_sim_device(args.device)
@@ -406,7 +425,8 @@ def main() -> None:
         drone.initialize()
 
         n = len(track_data)
-        init_pos = torch.tensor([track["positions"][0] for track in track_data], dtype=torch.float32, device=sim.device)
+        init_pos_np = np.stack([track["positions"][0] for track in track_data], axis=0)
+        init_pos = torch.tensor(init_pos_np, dtype=torch.float32, device=sim.device)
         init_rpy = torch.zeros((n, 3), dtype=torch.float32, device=sim.device)
         init_rpy[:, 2] = torch.tensor(init_yaws, dtype=torch.float32, device=sim.device)
         init_rot = euler_to_quaternion(init_rpy)
@@ -417,19 +437,17 @@ def main() -> None:
         sim._physics_sim_view.flush()
 
         controller = LeePositionController(g=9.81, uav_params=drone.params).to(sim.device)
-        camera_vis = None
+        render_product = None
+        rgb_annotator = None
         captured_frames = []
-        if args.record:
-            camera_cfg = PinholeCameraCfg(
-                sensor_tick=0,
-                resolution=(960, 720),
-                data_types=["rgb"],
-            )
-            camera_vis = Camera(camera_cfg)
-            camera_vis.initialize("/OmniverseKit_Persp")
+        set_camera_view(eye=args.camera_eye, target=args.camera_lookat)
 
-        if not args.headless:
-            set_camera_view(eye=args.camera_eye, target=args.camera_lookat)
+        if args.record:
+            render_resolution = tuple(int(v) for v in args.resolution)
+            render_product = rep.create.render_product("/OmniverseKit_Persp", render_resolution)
+            rgb_annotator = rep.AnnotatorRegistry.get_annotator("rgb", device="cpu")
+            rgb_annotator.attach([render_product])
+            sim.render()
 
         if args.save_stage:
             save_path = str(Path(args.save_stage).expanduser().resolve())
@@ -441,8 +459,8 @@ def main() -> None:
         if args.config:
             print(f"Loaded replay defaults from config: {Path(args.config).expanduser().resolve()}")
         print(f"Replaying {n} drones with total duration {total_duration:.2f}s at speed {args.speed:.2f}x")
+        sim.play()
 
-        start_wall = time.perf_counter()
         step_count = 0
         while simulation_app.is_running():
             if sim.is_stopped():
@@ -451,7 +469,7 @@ def main() -> None:
                 sim.render()
                 continue
 
-            elapsed = (time.perf_counter() - start_wall) * args.speed
+            elapsed = step_count * args.sim_dt * args.speed
             sim_t = elapsed % total_duration if args.loop else min(elapsed, total_duration)
 
             target_pos = np.stack([interp_array(track["timestamps"], track["positions"], sim_t) for track in track_data], axis=0)
@@ -470,8 +488,10 @@ def main() -> None:
             sim.step(render=True)
             step_count += 1
 
-            if camera_vis is not None and (step_count % max(1, args.record_every) == 0):
-                captured_frames.append(camera_vis.get_images()["rgb"].cpu())
+            if rgb_annotator is not None and (step_count % max(1, args.record_every) == 0):
+                frame = extract_rgb_frame(rgb_annotator)
+                if frame is not None:
+                    captured_frames.append(frame)
 
             if not args.loop and elapsed >= total_duration:
                 for _ in range(60):
@@ -481,8 +501,10 @@ def main() -> None:
                 break
 
         if captured_frames:
-            frames = torch.cat(captured_frames, dim=0).permute(0, 2, 3, 1)[..., :3].contiguous()
+            frames_np = np.stack(captured_frames, axis=0)
+            frames = torch.from_numpy(frames_np.copy())
             fps = max(1, int(round(1.0 / (args.sim_dt * max(1, args.record_every)))))
+            print(f"Captured {len(captured_frames)} frames at resolution {frames_np.shape[2]}x{frames_np.shape[1]}.")
             if args.video_output:
                 from torchvision.io import write_video
 
@@ -496,10 +518,12 @@ def main() -> None:
                     {
                         "scenario_duration": total_duration,
                         "num_drones": n,
-                        args.video_tag: wandb.Video(frames.permute(0, 3, 1, 2).numpy(), fps=fps, format="mp4"),
+                        args.video_tag: wandb.Video(np.transpose(frames_np, (0, 3, 1, 2)), fps=fps, format="mp4"),
                     }
                 )
         elif wandb_run is not None:
+            if args.record:
+                print("Recording was enabled, but no frames were captured.")
             wandb_run.log(
                 {
                     "scenario_duration": total_duration,
