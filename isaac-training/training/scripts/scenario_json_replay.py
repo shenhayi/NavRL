@@ -297,16 +297,68 @@ def build_wandb_run_name(base_name: str | None) -> str:
     return f"{prefix}_{timestamp}"
 
 
-def compute_scene_bounds(scenario: dict, track_data: list[dict]) -> tuple[float, float, float, float, float]:
+def _get_obstacle_value(obstacle: dict, *keys: str, default=None):
+    for key in keys:
+        if key in obstacle and obstacle[key] is not None:
+            return obstacle[key]
+    if default is not None:
+        return default
+    raise KeyError(f"Missing obstacle keys {keys}")
+
+
+def extract_box_obstacles(scenario: dict) -> tuple[list[dict], list[str]]:
+    obstacles = []
+    raw_types = []
+    supported_types = {"box", "cube", "cuboid", "obb", "static_box", "static_obstacle"}
+
+    for raw_obstacle in scenario.get("obstacles", []):
+        if not isinstance(raw_obstacle, dict):
+            continue
+
+        raw_type = raw_obstacle.get("type")
+        if raw_type is not None:
+            raw_types.append(str(raw_type))
+
+        normalized_type = str(raw_type).strip().lower() if raw_type is not None else "box"
+        if normalized_type not in supported_types and not any(
+            key in raw_obstacle for key in ("size_x", "x_width", "width", "dx")
+        ):
+            continue
+
+        try:
+            x = float(_get_obstacle_value(raw_obstacle, "x", "center_x", "cx"))
+            y = float(_get_obstacle_value(raw_obstacle, "y", "center_y", "cy"))
+            z = float(_get_obstacle_value(raw_obstacle, "z", "center_z", "cz"))
+            size_x = float(_get_obstacle_value(raw_obstacle, "size_x", "x_width", "width", "dx"))
+            size_y = float(_get_obstacle_value(raw_obstacle, "size_y", "y_width", "length", "dy"))
+            size_z = float(_get_obstacle_value(raw_obstacle, "size_z", "z_width", "height", "dz"))
+            yaw = float(_get_obstacle_value(raw_obstacle, "yaw", "angle", "heading", default=0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        obstacles.append(
+            {
+                "x": x,
+                "y": y,
+                "z": z,
+                "size_x": size_x,
+                "size_y": size_y,
+                "size_z": size_z,
+                "yaw": yaw,
+            }
+        )
+
+    return obstacles, sorted(set(raw_types))
+
+
+def compute_scene_bounds(obstacles: list[dict], track_data: list[dict]) -> tuple[float, float, float, float, float]:
     x_mins = []
     x_maxs = []
     y_mins = []
     y_maxs = []
     z_max = 0.0
 
-    for obs in scenario.get("obstacles", []):
-        if obs.get("type") != "box":
-            continue
+    for obs in obstacles:
         x = float(obs["x"])
         y = float(obs["y"])
         z = float(obs["z"])
@@ -341,12 +393,12 @@ def compute_scene_bounds(scenario: dict, track_data: list[dict]) -> tuple[float,
 
 
 def compute_camera_pose(
-    args: argparse.Namespace, scenario: dict, track_data: list[dict]
+    args: argparse.Namespace, obstacles: list[dict], track_data: list[dict]
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     if args.camera_mode == "manual":
         return tuple(args.camera_eye), tuple(args.camera_lookat)
 
-    x_min, x_max, y_min, y_max, z_max = compute_scene_bounds(scenario, track_data)
+    x_min, x_max, y_min, y_max, z_max = compute_scene_bounds(obstacles, track_data)
     center_x = 0.5 * (x_min + x_max)
     center_y = 0.5 * (y_min + y_max)
     scene_width = max(1.0, x_max - x_min)
@@ -363,6 +415,7 @@ def main() -> None:
     args = parse_args()
     scenario_path = Path(args.json).expanduser().resolve()
     scenario = load_scenario(scenario_path)
+    obstacles, obstacle_types = extract_box_obstacles(scenario)
 
     from omni.isaac.kit import SimulationApp
 
@@ -379,6 +432,7 @@ def main() -> None:
     try:
         import omni
         import omni.isaac.orbit.sim as sim_utils
+        from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
         from omni.isaac.core.simulation_context import SimulationContext
         from omni.isaac.core.utils.extensions import enable_extension
         from omni.isaac.core.utils.viewports import set_camera_view
@@ -446,48 +500,105 @@ def main() -> None:
         stage.DefinePrim("/World/Scenario", "Xform")
         stage.DefinePrim("/World/Scenario/Obstacles", "Xform")
 
-        for idx, obs in enumerate(scenario.get("obstacles", [])):
-            if obs.get("type") != "box":
-                continue
+        static_obstacles = []
+        static_obstacle_states = []
+
+        for idx, obs in enumerate(obstacles):
             prim_path = f"/World/Scenario/Obstacles/Obstacle_{idx:03d}"
-            marker_path = f"/World/Scenario/Obstacles/ObstacleMarker_{idx:03d}"
+            cap_path = f"/World/Scenario/Obstacles/ObstacleCap_{idx:03d}"
             yaw = float(obs.get("yaw", 0.0))
             size_x = float(obs["size_x"])
             size_y = float(obs["size_y"])
             size_z = float(obs["size_z"])
-            obstacle_cfg = sim_utils.CuboidCfg(
-                size=(size_x, size_y, size_z),
-                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(0.90, 0.73, 0.22),
-                    emissive_color=(0.08, 0.06, 0.02),
-                    roughness=0.35,
-                    metallic=0.05,
-                    opacity=0.55,
+
+            obstacle_cfg = RigidObjectCfg(
+                prim_path=prim_path,
+                spawn=sim_utils.CuboidCfg(
+                    size=(size_x, size_y, size_z),
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        rigid_body_enabled=True,
+                        kinematic_enabled=True,
+                        disable_gravity=True,
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                    collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(0.90, 0.73, 0.22),
+                        emissive_color=(0.08, 0.06, 0.02),
+                        roughness=0.35,
+                        metallic=0.05,
+                        opacity=0.42,
+                    ),
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=(float(obs["x"]), float(obs["y"]), float(obs["z"])),
+                    rot=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
                 ),
             )
-            obstacle_cfg.func(
-                prim_path,
-                obstacle_cfg,
-                translation=(float(obs["x"]), float(obs["y"]), float(obs["z"])),
-                orientation=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
-            )
-            marker_cfg = sim_utils.CuboidCfg(
-                size=(size_x, size_y, 0.04),
-                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                visual_material=sim_utils.PreviewSurfaceCfg(
-                    diffuse_color=(1.0, 0.42, 0.10),
-                    emissive_color=(0.30, 0.08, 0.02),
-                    roughness=0.15,
-                    metallic=0.0,
-                    opacity=1.0,
+
+            cap_thickness = min(0.08, max(0.04, size_z * 0.08))
+            cap_z = float(obs["z"]) + 0.5 * size_z + 0.5 * cap_thickness
+            cap_cfg = RigidObjectCfg(
+                prim_path=cap_path,
+                spawn=sim_utils.CuboidCfg(
+                    size=(size_x, size_y, cap_thickness),
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        rigid_body_enabled=True,
+                        kinematic_enabled=True,
+                        disable_gravity=True,
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                    collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(1.0, 0.42, 0.10),
+                        emissive_color=(0.35, 0.10, 0.03),
+                        roughness=0.15,
+                        metallic=0.0,
+                        opacity=1.0,
+                    ),
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=(float(obs["x"]), float(obs["y"]), cap_z),
+                    rot=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
                 ),
             )
-            marker_cfg.func(
-                marker_path,
-                marker_cfg,
-                translation=(float(obs["x"]), float(obs["y"]), 0.08),
-                orientation=(math.cos(yaw * 0.5), 0.0, 0.0, math.sin(yaw * 0.5)),
+
+            static_obstacles.append(RigidObject(cfg=obstacle_cfg))
+            static_obstacle_states.append(
+                [
+                    float(obs["x"]),
+                    float(obs["y"]),
+                    float(obs["z"]),
+                    math.cos(yaw * 0.5),
+                    0.0,
+                    0.0,
+                    math.sin(yaw * 0.5),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]
+            )
+
+            static_obstacles.append(RigidObject(cfg=cap_cfg))
+            static_obstacle_states.append(
+                [
+                    float(obs["x"]),
+                    float(obs["y"]),
+                    cap_z,
+                    math.cos(yaw * 0.5),
+                    0.0,
+                    0.0,
+                    math.sin(yaw * 0.5),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]
             )
 
         drones_with_traj = [d for d in scenario.get("drones", []) if d.get("trajectory")]
@@ -528,6 +639,13 @@ def main() -> None:
         drone.initialize()
 
         n = len(track_data)
+        if static_obstacles:
+            obstacle_state_tensor = torch.tensor(static_obstacle_states, dtype=torch.float32, device=sim.device)
+            for obstacle_asset, obstacle_state in zip(static_obstacles, obstacle_state_tensor):
+                obstacle_asset.write_root_state_to_sim(obstacle_state.unsqueeze(0))
+                obstacle_asset.write_data_to_sim()
+                obstacle_asset.update(args.sim_dt)
+
         init_pos_np = np.stack([track["positions"][0] for track in track_data], axis=0)
         init_pos = torch.tensor(init_pos_np, dtype=torch.float32, device=sim.device)
         init_rpy = torch.zeros((n, 3), dtype=torch.float32, device=sim.device)
@@ -543,7 +661,7 @@ def main() -> None:
         render_product = None
         rgb_annotator = None
         captured_frames = []
-        camera_eye, camera_lookat = compute_camera_pose(args, scenario, track_data)
+        camera_eye, camera_lookat = compute_camera_pose(args, obstacles, track_data)
         set_camera_view(eye=camera_eye, target=camera_lookat)
 
         if args.record:
@@ -562,6 +680,10 @@ def main() -> None:
         print(f"Loaded scenario: {scenario_path}")
         if args.config:
             print(f"Loaded replay defaults from config: {Path(args.config).expanduser().resolve()}")
+        print(
+            f"Loaded {len(obstacles)} replay obstacles."
+            + (f" Raw obstacle types: {', '.join(obstacle_types)}" if obstacle_types else "")
+        )
         print(f"Replaying {n} drones with total duration {total_duration:.2f}s at speed {args.speed:.2f}x")
         print(
             "Camera pose:"
