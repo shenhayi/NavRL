@@ -7,9 +7,9 @@ headless: true
 device: "cuda:0"
 
 viewer:
-  eye: [0.0, 2.5, 24.0]
+  eye: [0.0, 2.5, 60.0]
   lookat: [0.0, 2.5, 0.0]
-  resolution: [2560, 1440]
+  resolution: [1920, 1080]
 
 wandb:
   project: NavRL
@@ -28,9 +28,11 @@ replay:
   drone_model: Hummingbird
   sim_dt: 0.01
   ground_size: 120.0
-  camera_mode: fit_topdown
+  camera_mode: manual
   camera_margin: 1.12
   camera_fov_deg: 60.0
+  camera_eye: [0.0, 2.5, 60.0]
+  camera_lookat: [0.0, 2.5, 0.0]
   record: true
   record_every: 1
   video_tag: recording
