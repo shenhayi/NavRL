@@ -65,6 +65,7 @@ DEFAULT_ARGS = {
     "drone_model": "Hummingbird",
     "sim_dt": 0.01,
     "ground_size": 120.0,
+    "obstacle_material": "navrl",
     "camera_mode": "fit_topdown",
     "camera_margin": 1.12,
     "camera_fov_deg": 60.0,
@@ -135,6 +136,7 @@ def config_arg_defaults(config: dict) -> dict:
         "drone_model": first_non_none(replay_cfg.get("drone_model"), get_nested(config, "drone", "model_name")),
         "sim_dt": first_non_none(replay_cfg.get("sim_dt"), get_nested(config, "sim", "dt")),
         "ground_size": replay_cfg.get("ground_size"),
+        "obstacle_material": replay_cfg.get("obstacle_material"),
         "camera_mode": replay_cfg.get("camera_mode"),
         "camera_margin": replay_cfg.get("camera_margin"),
         "camera_fov_deg": replay_cfg.get("camera_fov_deg"),
@@ -173,6 +175,13 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--sim-dt", type=float, default=defaults["sim_dt"], help="Physics and rendering dt")
     parser.add_argument("--device", type=str, default=defaults["device"], help="Simulation device. Defaults to config value, otherwise auto-detect.")
     parser.add_argument("--ground-size", type=float, default=defaults["ground_size"], help="Ground plane size in meters")
+    parser.add_argument(
+        "--obstacle-material",
+        type=str,
+        default=defaults["obstacle_material"],
+        choices=("navrl", "transparent"),
+        help="Obstacle surface style. 'navrl' matches the green opaque material used by NavRL training obstacles.",
+    )
     parser.add_argument("--camera-mode", type=str, default=defaults["camera_mode"], choices=("fit_topdown", "manual"), help="Use an automatic top-down scene fit or the manual camera coordinates below")
     parser.add_argument("--camera-margin", type=float, default=defaults["camera_margin"], help="Extra margin applied when fitting the top-down camera")
     parser.add_argument("--camera-fov-deg", type=float, default=defaults["camera_fov_deg"], help="Vertical camera field of view used for top-down fitting")
@@ -306,6 +315,93 @@ def _get_obstacle_value(obstacle: dict, *keys: str, default=None):
     raise KeyError(f"Missing obstacle keys {keys}")
 
 
+def _get_first_present(mapping: dict, *keys: str, default=None):
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
+def quat_wxyz_to_yaw(quat, fallback_yaw: float = 0.0) -> float:
+    if quat is None or len(quat) != 4:
+        return fallback_yaw
+    w, x, y, z = (float(v) for v in quat)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def infer_timestamps(traj: dict, num_samples: int) -> np.ndarray:
+    timestamps = _get_first_present(traj, "timestamps", "time")
+    if timestamps is not None:
+        return np.asarray(timestamps, dtype=float)
+    if num_samples <= 0:
+        return np.zeros((0,), dtype=float)
+    dt = float(_get_first_present(traj, "dt", default=0.01))
+    duration = _get_first_present(traj, "duration")
+    if duration is not None and num_samples > 1:
+        return np.linspace(0.0, float(duration), num=num_samples, dtype=float)
+    return np.arange(num_samples, dtype=float) * dt
+
+
+def infer_velocities(traj: dict, positions: np.ndarray, timestamps: np.ndarray) -> np.ndarray:
+    velocities = _get_first_present(traj, "velocities", "velocities_world")
+    if velocities is not None:
+        vel = np.asarray(velocities, dtype=float)
+        if len(vel) == len(positions):
+            return vel
+
+    vel = np.zeros_like(positions, dtype=float)
+    if len(positions) <= 1:
+        return vel
+
+    diffs = np.diff(positions, axis=0)
+    dt = np.diff(timestamps)
+    dt = np.maximum(dt, 1e-6)
+    vel[:-1] = diffs / dt[:, None]
+    vel[-1] = vel[-2]
+    return vel
+
+
+def extract_track_data(scenario: dict) -> tuple[list[dict], list[tuple[float, float, float]], list[float]]:
+    start_positions = []
+    track_data = []
+    init_yaws = []
+
+    for index, drone_data in enumerate(scenario.get("drones", [])):
+        traj = drone_data.get("trajectory") or {}
+        positions_raw = _get_first_present(traj, "positions", "positions_world")
+        if positions_raw is None:
+            continue
+
+        positions = np.asarray(positions_raw, dtype=float)
+        if positions.ndim != 2 or positions.shape[0] == 0:
+            continue
+
+        timestamps = infer_timestamps(traj, len(positions))
+        if len(timestamps) != len(positions):
+            continue
+
+        velocities = infer_velocities(traj, positions, timestamps)
+        initial_orientation = drone_data.get("initial_orientation_wxyz")
+        fallback_yaw = quat_wxyz_to_yaw(initial_orientation, 0.0)
+        init_yaw = yaw_from_velocity(velocities[0], fallback_yaw)
+
+        start_positions.append(tuple(positions[0].tolist()))
+        init_yaws.append(init_yaw)
+        track_data.append(
+            {
+                "id": int(drone_data.get("id", index)),
+                "timestamps": timestamps,
+                "positions": positions,
+                "velocities": velocities,
+                "fallback_yaw": init_yaw,
+            }
+        )
+
+    return track_data, start_positions, init_yaws
+
+
 def extract_box_obstacles(scenario: dict) -> tuple[list[dict], list[str]]:
     obstacles = []
     raw_types = []
@@ -349,6 +445,42 @@ def extract_box_obstacles(scenario: dict) -> tuple[list[dict], list[str]]:
         )
 
     return obstacles, sorted(set(raw_types))
+
+
+def track_duration(track_data: list[dict]) -> float:
+    duration = 0.0
+    for track in track_data:
+        timestamps = track.get("timestamps")
+        if timestamps is not None and len(timestamps) > 0:
+            duration = max(duration, float(timestamps[-1]))
+    return max(duration, 0.1)
+
+
+def make_obstacle_materials(sim_utils, material_style: str):
+    if material_style == "navrl":
+        body_material = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.0, 1.0, 0.0),
+            metallic=0.2,
+            roughness=0.45,
+            opacity=1.0,
+        )
+        cap_material = body_material
+    else:
+        body_material = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.90, 0.73, 0.22),
+            emissive_color=(0.08, 0.06, 0.02),
+            roughness=0.35,
+            metallic=0.05,
+            opacity=0.42,
+        )
+        cap_material = sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(1.0, 0.42, 0.10),
+            emissive_color=(0.35, 0.10, 0.03),
+            roughness=0.15,
+            metallic=0.0,
+            opacity=1.0,
+        )
+    return body_material, cap_material
 
 
 def compute_scene_bounds(obstacles: list[dict], track_data: list[dict]) -> tuple[float, float, float, float, float]:
@@ -467,6 +599,7 @@ def main() -> None:
                     "drone_model": args.drone_model,
                     "sim_dt": args.sim_dt,
                     "device": sim_device,
+                    "obstacle_material": args.obstacle_material,
                     "record": args.record,
                     "record_every": args.record_every,
                     "resolution": list(args.resolution),
@@ -502,6 +635,7 @@ def main() -> None:
 
         static_obstacles = []
         static_obstacle_states = []
+        obstacle_body_material, obstacle_cap_material = make_obstacle_materials(sim_utils, args.obstacle_material)
 
         for idx, obs in enumerate(obstacles):
             prim_path = f"/World/Scenario/Obstacles/Obstacle_{idx:03d}"
@@ -522,13 +656,7 @@ def main() -> None:
                     ),
                     mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
                     collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=(0.90, 0.73, 0.22),
-                        emissive_color=(0.08, 0.06, 0.02),
-                        roughness=0.35,
-                        metallic=0.05,
-                        opacity=0.42,
-                    ),
+                    visual_material=obstacle_body_material,
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(float(obs["x"]), float(obs["y"]), float(obs["z"])),
@@ -549,13 +677,7 @@ def main() -> None:
                     ),
                     mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
                     collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                    visual_material=sim_utils.PreviewSurfaceCfg(
-                        diffuse_color=(1.0, 0.42, 0.10),
-                        emissive_color=(0.35, 0.10, 0.03),
-                        roughness=0.15,
-                        metallic=0.0,
-                        opacity=1.0,
-                    ),
+                    visual_material=obstacle_cap_material,
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(float(obs["x"]), float(obs["y"]), cap_z),
@@ -601,35 +723,10 @@ def main() -> None:
                 ]
             )
 
-        drones_with_traj = [d for d in scenario.get("drones", []) if d.get("trajectory")]
-        if not drones_with_traj:
-            raise RuntimeError("No drones with trajectories found in scenario JSON.")
-
         drone_cls = MultirotorBase.REGISTRY[args.drone_model]
         drone = drone_cls()
 
-        start_positions = []
-        track_data = []
-        init_yaws = []
-        for drone_data in drones_with_traj:
-            traj = drone_data["trajectory"]
-            ts = np.array(traj["timestamps"], dtype=float)
-            pos = np.array(traj["positions"], dtype=float)
-            vel = np.array(traj["velocities"], dtype=float)
-            if len(ts) == 0:
-                continue
-            start_positions.append(tuple(pos[0].tolist()))
-            init_yaw = yaw_from_velocity(vel[0], 0.0)
-            init_yaws.append(init_yaw)
-            track_data.append(
-                {
-                    "id": int(drone_data["id"]),
-                    "timestamps": ts,
-                    "positions": pos,
-                    "velocities": vel,
-                    "fallback_yaw": init_yaw,
-                }
-            )
+        track_data, start_positions, init_yaws = extract_track_data(scenario)
 
         if not track_data:
             raise RuntimeError("No non-empty trajectories found in scenario JSON.")
@@ -676,7 +773,7 @@ def main() -> None:
             omni.usd.get_context().save_as_stage(save_path)
             print(f"Saved generated stage to {save_path}")
 
-        total_duration = scenario_duration(drones_with_traj)
+        total_duration = track_duration(track_data)
         print(f"Loaded scenario: {scenario_path}")
         if args.config:
             print(f"Loaded replay defaults from config: {Path(args.config).expanduser().resolve()}")
@@ -684,6 +781,7 @@ def main() -> None:
             f"Loaded {len(obstacles)} replay obstacles."
             + (f" Raw obstacle types: {', '.join(obstacle_types)}" if obstacle_types else "")
         )
+        print(f"Obstacle material: {args.obstacle_material}")
         print(f"Replaying {n} drones with total duration {total_duration:.2f}s at speed {args.speed:.2f}x")
         print(
             "Camera pose:"

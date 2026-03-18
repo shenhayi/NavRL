@@ -7,7 +7,7 @@ headless: true
 device: "cuda:0"
 
 viewer:
-  eye: [0.0, 2.5, 60.0]
+  eye: [0.0, 2.5, 55.0]
   lookat: [0.0, 2.5, 0.0]
   resolution: [1920, 1080]
 
@@ -28,6 +28,7 @@ replay:
   drone_model: Hummingbird
   sim_dt: 0.01
   ground_size: 120.0
+  obstacle_material: navrl
   camera_mode: manual
   camera_margin: 1.12
   camera_fov_deg: 60.0
