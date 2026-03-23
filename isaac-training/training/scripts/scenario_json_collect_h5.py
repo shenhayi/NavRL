@@ -1339,7 +1339,6 @@ def main() -> None:
         from omni.isaac.core.simulation_context import SimulationContext
         from omni.isaac.core.utils.extensions import enable_extension
         from omni.isaac.core.utils.semantics import add_update_semantics
-        from omni.isaac.core.utils.viewports import set_camera_view
         from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
         from omni_drones.controllers import LeePositionController
         from omni_drones.robots.drone import MultirotorBase
@@ -1348,9 +1347,14 @@ def main() -> None:
 
         h5py = load_h5py()
 
-        enable_extension("omni.kit.viewport.rtx")
-        enable_extension("omni.kit.viewport.pxr")
-        enable_extension("omni.kit.viewport.bundle")
+        if not args.headless:
+            enable_extension("omni.kit.viewport.rtx")
+            enable_extension("omni.kit.viewport.pxr")
+            enable_extension("omni.kit.viewport.bundle")
+            from omni.isaac.core.utils.viewports import set_camera_view
+        else:
+            set_camera_view = None
+
         enable_extension("omni.replicator.isaac")
         if args.lidar_backend == "rtx":
             enable_extension("omni.isaac.sensor")
