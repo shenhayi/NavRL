@@ -1023,6 +1023,18 @@ class RtxLidarRig:
         self.profile = load_rtx_lidar_profile(config_name)
         self.sensors = []
         self.prim_paths: list[str] = []
+        self.elevation_deg = np.asarray((self.profile.get("profile") or {}).get("emitters", {}).get("elevationDeg") or [], dtype=np.float32)
+        self.azimuth_offsets_deg = np.asarray((self.profile.get("profile") or {}).get("emitters", {}).get("azimuthDeg") or np.zeros_like(self.elevation_deg), dtype=np.float32)
+        if self.elevation_deg.size == 0:
+            raise RuntimeError(f"RTX lidar config {self.config_name} has no emitter elevationDeg values.")
+        if self.azimuth_offsets_deg.size != self.elevation_deg.size:
+            raise RuntimeError(f"RTX lidar config {self.config_name} has emitter azimuth/elevation length mismatch.")
+        profile_cfg = self.profile.get("profile") or {}
+        self.start_az_deg = float(profile_cfg.get("startAzimuthDeg", 0.0))
+        self.end_az_deg = float(profile_cfg.get("endAzimuthDeg", 360.0))
+        if self.end_az_deg <= self.start_az_deg:
+            self.end_az_deg = self.start_az_deg + 360.0
+        self.azimuth_span_deg = self.end_az_deg - self.start_az_deg
         self.num_rows: int | None = None
         self.num_cols: int | None = None
         self.horizontal_resolution_deg: float | None = None
@@ -1042,8 +1054,10 @@ class RtxLidarRig:
                     config_file_name=self.config_name,
                 )
                 print(f"  RTX lidar[{idx}] prim created")
-                sensor.add_linear_depth_data_to_frame()
-                print(f"  RTX lidar[{idx}] annotator attached")
+                sensor.add_range_data_to_frame()
+                sensor.add_azimuth_data_to_frame()
+                sensor.add_elevation_data_to_frame()
+                print(f"  RTX lidar[{idx}] annotators attached")
                 sensor.initialize()
                 print(f"  RTX lidar[{idx}] initialized")
             except Exception as exc:
@@ -1058,13 +1072,17 @@ class RtxLidarRig:
         for _ in range(3):
             sim.render()
         first_sensor = self.sensors[0]
-        self.num_rows = int(first_sensor.get_num_rows())
-        self.num_cols = int(first_sensor.get_num_cols())
-        self.horizontal_resolution_deg = float(first_sensor.get_horizontal_resolution())
-        if self.num_rows <= 0 or self.num_cols <= 0:
-            raise RuntimeError(
-                f"RTX lidar produced invalid resolution rows={self.num_rows} cols={self.num_cols} for config {self.config_name}"
-            )
+        flat_cols = int(first_sensor.get_num_cols())
+        flat_hres = float(first_sensor.get_horizontal_resolution())
+        profile_cfg = self.profile.get("profile") or {}
+        report_rate = float(profile_cfg.get("reportRateBaseHz", 0.0))
+        scan_rate = float(profile_cfg.get("scanRateBaseHz", 0.0))
+        derived_cols = int(round(report_rate / scan_rate)) if report_rate > 0.0 and scan_rate > 0.0 else 0
+        self.num_rows = int(self.elevation_deg.size)
+        self.num_cols = flat_cols if flat_cols > 0 else derived_cols
+        if self.num_cols <= 0:
+            raise RuntimeError(f"RTX lidar produced invalid horizontal resolution for config {self.config_name}")
+        self.horizontal_resolution_deg = flat_hres if flat_hres > 0.0 else (self.azimuth_span_deg / float(self.num_cols))
 
     def ray_directions_local(self) -> np.ndarray:
         if self.num_cols is None:
@@ -1072,35 +1090,41 @@ class RtxLidarRig:
         return compute_rtx_ray_directions_local(self.profile, self.num_cols)
 
     def capture(self) -> RtxLidarFrame:
-        if self.num_rows is None or self.num_cols is None:
+        if self.num_rows is None or self.num_cols is None or self.horizontal_resolution_deg is None:
             raise RuntimeError("RTX lidar rig must be initialized before capture.")
 
         range_images = []
+        elev_emitters_rad = np.deg2rad(self.elevation_deg.astype(np.float32, copy=False))
+        azimuth_step_deg = self.azimuth_span_deg / float(self.num_cols)
         for sensor in self.sensors:
             data = sensor.get_current_frame()
-            depth = np.asarray(data["linear_depth_data"], dtype=np.float32)
-            if depth.ndim == 1:
-                if depth.size != self.num_rows * self.num_cols:
-                    raise RuntimeError(
-                        f"Unexpected RTX lidar flat scan size {depth.size}; expected {self.num_rows * self.num_cols}."
-                    )
-                depth = depth.reshape(self.num_rows, self.num_cols)
-            elif depth.ndim == 2:
-                if depth.shape == (self.num_cols, self.num_rows):
-                    depth = depth.T
-                elif depth.shape != (self.num_rows, self.num_cols):
-                    depth = depth.reshape(self.num_rows, self.num_cols)
-            else:
-                depth = depth.reshape(self.num_rows, self.num_cols)
+            distances = np.asarray(data.get("range", []), dtype=np.float32).reshape(-1)
+            azimuth = np.asarray(data.get("azimuth", []), dtype=np.float32).reshape(-1)
+            elevation = np.asarray(data.get("elevation", []), dtype=np.float32).reshape(-1)
+            if not (distances.size == azimuth.size == elevation.size):
+                raise RuntimeError(
+                    f"RTX lidar return size mismatch: range={distances.size} azimuth={azimuth.size} elevation={elevation.size}"
+                )
 
-            depth = np.nan_to_num(
-                depth,
-                nan=self.range_limits[1],
-                posinf=self.range_limits[1],
-                neginf=self.range_limits[0],
-            )
-            depth = np.clip(depth, self.range_limits[0], self.range_limits[1]).astype(np.float32, copy=False)
-            range_images.append(depth.T)
+            image = np.full((self.num_cols, self.num_rows), self.range_limits[1], dtype=np.float32)
+            if distances.size > 0:
+                valid = np.isfinite(distances) & np.isfinite(azimuth) & np.isfinite(elevation)
+                valid &= distances > 0.0
+                if np.any(valid):
+                    distances = np.clip(distances[valid], self.range_limits[0], self.range_limits[1])
+                    azimuth_deg = np.rad2deg(azimuth[valid])
+                    elevation_rad = elevation[valid]
+
+                    row_idx = np.abs(elevation_rad[:, None] - elev_emitters_rad[None, :]).argmin(axis=1)
+                    base_azimuth_deg = azimuth_deg - self.azimuth_offsets_deg[row_idx]
+                    col_float = ((base_azimuth_deg - self.start_az_deg) % self.azimuth_span_deg) / azimuth_step_deg
+                    col_idx = np.mod(np.rint(col_float).astype(np.int64), self.num_cols)
+
+                    for c, r, d in zip(col_idx.tolist(), row_idx.tolist(), distances.tolist()):
+                        if d < image[c, r]:
+                            image[c, r] = d
+
+            range_images.append(image)
 
         lidar_range = np.stack(range_images, axis=0)
         hit_type = (lidar_range < (self.range_limits[1] - 1e-4)).astype(np.uint8, copy=False)
