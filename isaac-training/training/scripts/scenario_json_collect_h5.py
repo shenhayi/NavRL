@@ -684,11 +684,12 @@ def compute_rtx_ray_directions_local(profile_data: dict, num_cols: int) -> np.nd
     azimuth_rad = np.deg2rad(azimuth_deg)
 
     cos_elev = np.cos(elevation_rad)
+    sin_elev = np.broadcast_to(np.sin(elevation_rad), azimuth_rad.shape)
     ray_dirs = np.stack(
         [
             cos_elev * np.cos(azimuth_rad),
             cos_elev * np.sin(azimuth_rad),
-            np.sin(elevation_rad),
+            sin_elev,
         ],
         axis=-1,
     )
