@@ -7,8 +7,8 @@ headless: true
 device: "cuda:0"
 
 viewer:
-  eye: [0.0, 2.5, 55.0]
-  lookat: [0.0, 2.5, 0.0]
+  camera_eye: [0.0, 0.0, 35.0]
+  camera_lookat: [0.0, 0.0, 0.0]
   resolution: [1920, 1080]
 
 wandb:
@@ -32,8 +32,8 @@ replay:
   camera_mode: manual
   camera_margin: 1.12
   camera_fov_deg: 60.0
-  camera_eye: [0.0, 2.5, 60.0]
-  camera_lookat: [0.0, 2.5, 0.0]
+  camera_eye: [0.0, 0.0, 35.0]
+  camera_lookat: [0.0, 0.0, 0.0]
   record: true
   record_every: 1
   video_tag: recording

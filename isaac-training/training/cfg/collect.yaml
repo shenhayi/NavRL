@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+  - drone
+  - sim
+
+headless: true
+device: "cuda:0"
+
+viewer:
+  anti_aliasing: 4
+
+collect:
+  # Replace with your scenario_data.json path.
+  json: /abs/path/to/scenario_data.json
+  # Optional explicit output path. Defaults to <json stem>.h5 when left empty.
+  output:
+  headless: true
+  anti_aliasing: 4
+  drone_model: Hummingbird
+  sim_dt: 0.01
+  ground_size: 120.0
+  obstacle_material: navrl
+  save_stage:
+  compression: lzf
+  store_global_cloud: false
+
+  # LiDAR
+  lidar_backend: rtx
+  rtx_lidar_config: MID360_40ch20hz1024res
+  lidar_hres: 1.0
+  lidar_vbeams: 40
+  # Leave these null to follow the scenario JSON sensor metadata.
+  lidar_min_range:
+  lidar_max_range:
+  lidar_vfov_up_deg:
+  lidar_vfov_down_deg:
+  lidar_forward_tilt_deg:
+  lidar_attach_yaw_only: false
+  lidar_offset: [0.0, 0.0, 0.0]
+  # Used only by the legacy raycast backend.
+  peer_box_size: [0.12, 0.12, 0.16]
+
+  # Camera
+  camera_resolution: [640, 480]
+  camera_offset: [0.08, 0.0, 0.0]
+  camera_target: [1.08, 0.0, 0.0]
+  camera_focus_distance: 4.0
+  camera_focal_length: 3.43
+  camera_horizontal_aperture: 6.4
+  camera_clip_range: [0.1, 30.0]
