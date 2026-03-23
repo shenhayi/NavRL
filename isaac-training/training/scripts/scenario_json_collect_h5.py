@@ -29,6 +29,7 @@ import json
 import math
 import os
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -971,15 +972,24 @@ class RtxLidarRig:
         orientation = np.asarray(quat_from_euler_deg(0.0, self.forward_tilt_deg, 0.0), dtype=np.float32)
         translation = np.asarray(self.offset, dtype=np.float32)
         for idx, prim_path in enumerate(prim_paths):
-            sensor = LidarRtx(
-                prim_path=prim_path,
-                name=f"mid360_{idx}",
-                translation=translation,
-                orientation=orientation,
-                config_file_name=self.config_name,
-            )
-            sensor.add_linear_depth_data_to_frame()
-            sensor.initialize()
+            print(f"  RTX lidar[{idx}] create start: path={prim_path} config={self.config_name}")
+            try:
+                sensor = LidarRtx(
+                    prim_path=prim_path,
+                    name=f"mid360_{idx}",
+                    translation=translation,
+                    orientation=orientation,
+                    config_file_name=self.config_name,
+                )
+                print(f"  RTX lidar[{idx}] prim created")
+                sensor.add_linear_depth_data_to_frame()
+                print(f"  RTX lidar[{idx}] annotator attached")
+                sensor.initialize()
+                print(f"  RTX lidar[{idx}] initialized")
+            except Exception as exc:
+                print(f"  RTX lidar[{idx}] failed: {exc}")
+                traceback.print_exc()
+                raise
             self.sensors.append(sensor)
 
     def initialize(self, sim) -> None:
@@ -1795,6 +1805,9 @@ def main() -> None:
 
         print(f"Wrote swarm dataset to {output_path}")
 
+    except Exception:
+        traceback.print_exc()
+        raise
     finally:
         try:
             if writer is not None:
