@@ -13,7 +13,7 @@ collect:
   # Replace with your scenario_data.json path.
   json: /abs/path/to/scenario_data.json
   # Optional output file or directory. If a directory is given, the collector writes <json stem>.h5 inside it.
-  output: /home/haoyus/projects/NavRL/NavRL-code/NavRL/output/h5
+  output: output/h5
   headless: true
   anti_aliasing: 4
   drone_model: Hummingbird
@@ -23,6 +23,9 @@ collect:
   save_stage:
   compression: lzf
   store_global_cloud: false
+  save_hz: 30.0
+  lidar_hz: 10.0
+  camera_hz: 30.0
 
   # LiDAR
   lidar_backend: rtx

@@ -45,8 +45,9 @@ ISAAC_TRAINING_DIR = TRAINING_DIR.parent
 THIRD_PARTY_DIR = ISAAC_TRAINING_DIR / "third_party"
 OMNIDRONES_DIR = THIRD_PARTY_DIR / "OmniDrones"
 ORBIT_SOURCE_DIR = THIRD_PARTY_DIR / "orbit" / "source"
-REPO_ROOT = ISAAC_TRAINING_DIR.parents[2]
-ISAAC_SIM_DIR = REPO_ROOT / "isaac-sim"
+PROJECT_ROOT = ISAAC_TRAINING_DIR.parent
+WORKSPACE_ROOT = PROJECT_ROOT.parents[1]
+ISAAC_SIM_DIR = WORKSPACE_ROOT / "isaac-sim"
 
 
 def iter_isaac_sim_dirs() -> list[Path]:
@@ -103,6 +104,9 @@ DEFAULT_ARGS = {
     "device": None,
     "compression": "lzf",
     "store_global_cloud": False,
+    "save_hz": 30.0,
+    "lidar_hz": 10.0,
+    "camera_hz": 30.0,
     "lidar_backend": "rtx",
     "rtx_lidar_config": None,
     "lidar_hres": 1.0,
@@ -176,6 +180,9 @@ def config_arg_defaults(config: dict) -> dict:
         "device": first_non_none(collect_cfg.get("device"), config.get("device"), get_nested(config, "sim", "device")),
         "compression": collect_cfg.get("compression"),
         "store_global_cloud": collect_cfg.get("store_global_cloud"),
+        "save_hz": collect_cfg.get("save_hz"),
+        "lidar_hz": collect_cfg.get("lidar_hz"),
+        "camera_hz": collect_cfg.get("camera_hz"),
         "lidar_backend": collect_cfg.get("lidar_backend"),
         "rtx_lidar_config": collect_cfg.get("rtx_lidar_config"),
         "lidar_hres": collect_cfg.get("lidar_hres"),
@@ -229,6 +236,9 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
         help="H5 dataset compression",
     )
     parser.add_argument("--store-global-cloud", action=argparse.BooleanOptionalAction, default=defaults["store_global_cloud"], help="Store scenario.global_cloud_world once in the H5")
+    parser.add_argument("--save-hz", type=float, default=defaults["save_hz"], help="Dataset write frequency in Hz")
+    parser.add_argument("--lidar-hz", type=float, default=defaults["lidar_hz"], help="LiDAR refresh frequency in Hz")
+    parser.add_argument("--camera-hz", type=float, default=defaults["camera_hz"], help="Camera refresh frequency in Hz")
 
     parser.add_argument("--lidar-backend", type=str, default=defaults["lidar_backend"], choices=("rtx", "raycast"), help="LiDAR backend used for collection")
     parser.add_argument("--rtx-lidar-config", type=str, default=defaults["rtx_lidar_config"], help="RTX LiDAR config name or .json path resolved from Isaac Sim lidar_configs")
@@ -275,10 +285,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("Scenario JSON path is required. Pass --json or set collect.json/json in --config.")
 
     json_path = Path(args.json).expanduser().resolve()
+    default_output_dir = PROJECT_ROOT / "output" / "h5"
     if args.output is None:
-        output_path = json_path.with_suffix(".h5")
+        output_path = default_output_dir / f"{json_path.stem}.h5"
     else:
         output_path = Path(args.output).expanduser()
+        if not output_path.is_absolute():
+            output_path = PROJECT_ROOT / output_path
         suffix = output_path.suffix.lower()
         treat_as_directory = (output_path.exists() and output_path.is_dir()) or suffix not in (".h5", ".hdf5")
         if treat_as_directory:
@@ -311,6 +324,19 @@ def parse_args() -> argparse.Namespace:
         parser.error("--lidar-vbeams must be positive.")
     if args.sim_dt <= 0.0:
         parser.error("--sim-dt must be positive.")
+    sim_hz = 1.0 / float(args.sim_dt)
+    if args.save_hz <= 0.0:
+        parser.error("--save-hz must be positive.")
+    if args.lidar_hz <= 0.0:
+        parser.error("--lidar-hz must be positive.")
+    if args.camera_hz <= 0.0:
+        parser.error("--camera-hz must be positive.")
+    if args.save_hz > sim_hz + 1e-6:
+        parser.error(f"--save-hz must be <= simulation rate ({sim_hz:.3f} Hz).")
+    if args.lidar_hz > sim_hz + 1e-6:
+        parser.error(f"--lidar-hz must be <= simulation rate ({sim_hz:.3f} Hz).")
+    if args.camera_hz > sim_hz + 1e-6:
+        parser.error(f"--camera-hz must be <= simulation rate ({sim_hz:.3f} Hz).")
     return args
 
 
@@ -1154,6 +1180,9 @@ class SwarmH5Writer:
         root.attrs["dataset_version"] = "swarm_collect_v1"
         root.attrs["source_json"] = str(scenario_path)
         root.attrs["sim_dt"] = float(args.sim_dt)
+        root.attrs["save_hz"] = float(args.save_hz)
+        root.attrs["lidar_hz"] = float(args.lidar_hz)
+        root.attrs["camera_hz"] = float(args.camera_hz)
         root.attrs["num_drones"] = len(track_data)
         root.attrs["num_obstacles"] = len(obstacles)
         root.attrs["compression"] = "none" if self.compression is None else self.compression
@@ -1766,6 +1795,20 @@ def main() -> None:
             ray_dirs_local=lidar_ray_dirs_local,
         )
 
+        save_period = 1.0 / float(args.save_hz)
+        lidar_period = 1.0 / float(args.lidar_hz)
+        camera_period = 1.0 / float(args.camera_hz)
+        next_save_t = 0.0
+        next_lidar_t = 0.0
+        next_camera_t = 0.0
+        last_lidar_range = None
+        last_lidar_navrl = None
+        last_lidar_hit_type_np = None
+        last_lidar_peer_id_np = None
+        last_lidar_sample_t = np.float32(0.0)
+        last_camera_frame = None
+        last_camera_sample_t = np.float32(0.0)
+
         for step_idx in range(total_steps):
             if not simulation_app.is_running():
                 break
@@ -1796,43 +1839,53 @@ def main() -> None:
             active_mask = torch.tensor(np.asarray(active_mask_np, dtype=bool), dtype=torch.bool, device=sim.device)
 
             root_state = drone.get_state()[..., :13].squeeze(0)
-            if args.lidar_backend == "raycast":
-                lidar.update(args.sim_dt)
 
-                ray_origins_w = lidar.data.pos_w.unsqueeze(1) + rotate_local_points(lidar.data.quat_w, lidar.ray_starts)
-                ray_dirs_w = rotate_local_vectors(lidar.data.quat_w, lidar.ray_directions)
-                static_dist = (lidar.data.ray_hits_w - ray_origins_w).norm(dim=-1)
-                static_valid = torch.isfinite(static_dist)
-                static_dist = torch.where(
-                    static_valid,
-                    static_dist.clamp(min=float(args.lidar_min_range), max=float(args.lidar_max_range)),
-                    torch.full_like(static_dist, float(args.lidar_max_range)),
-                )
+            lidar_is_new = False
+            if last_lidar_range is None or sim_t + 1e-9 >= next_lidar_t or step_idx == total_steps - 1:
+                if args.lidar_backend == "raycast":
+                    lidar.update(args.sim_dt)
 
-                peer_dist, peer_id = compute_peer_overlay(
-                    ray_starts_w=ray_origins_w,
-                    ray_dirs_w=ray_dirs_w,
-                    root_state=root_state,
-                    peer_box_size=peer_box_size,
-                    min_range=float(args.lidar_min_range),
-                    max_range=float(args.lidar_max_range),
-                )
-                final_dist, hit_type, final_peer_id = combine_lidar_hits(
-                    static_dist=static_dist,
-                    peer_dist=peer_dist,
-                    peer_id=peer_id,
-                    max_range=float(args.lidar_max_range),
-                )
-                lidar_range = final_dist.reshape(n, *lidar_resolution)
-                lidar_navrl = (float(args.lidar_max_range) - final_dist).reshape(n, 1, *lidar_resolution)
-                lidar_hit_type_np = tensor_to_np(hit_type.reshape(n, *lidar_resolution), np.uint8)
-                lidar_peer_id_np = tensor_to_np(final_peer_id.reshape(n, *lidar_resolution), np.int16)
-            else:
-                lidar_frame = rtx_lidar_rig.capture()
-                lidar_range = torch.as_tensor(lidar_frame.range_image, dtype=torch.float32, device=sim.device)
-                lidar_navrl = (float(args.lidar_max_range) - lidar_range).unsqueeze(1)
-                lidar_hit_type_np = lidar_frame.hit_type
-                lidar_peer_id_np = lidar_frame.peer_id
+                    ray_origins_w = lidar.data.pos_w.unsqueeze(1) + rotate_local_points(lidar.data.quat_w, lidar.ray_starts)
+                    ray_dirs_w = rotate_local_vectors(lidar.data.quat_w, lidar.ray_directions)
+                    static_dist = (lidar.data.ray_hits_w - ray_origins_w).norm(dim=-1)
+                    static_valid = torch.isfinite(static_dist)
+                    static_dist = torch.where(
+                        static_valid,
+                        static_dist.clamp(min=float(args.lidar_min_range), max=float(args.lidar_max_range)),
+                        torch.full_like(static_dist, float(args.lidar_max_range)),
+                    )
+
+                    peer_dist, peer_id = compute_peer_overlay(
+                        ray_starts_w=ray_origins_w,
+                        ray_dirs_w=ray_dirs_w,
+                        root_state=root_state,
+                        peer_box_size=peer_box_size,
+                        min_range=float(args.lidar_min_range),
+                        max_range=float(args.lidar_max_range),
+                    )
+                    final_dist, hit_type, final_peer_id = combine_lidar_hits(
+                        static_dist=static_dist,
+                        peer_dist=peer_dist,
+                        peer_id=peer_id,
+                        max_range=float(args.lidar_max_range),
+                    )
+                    last_lidar_range = final_dist.reshape(n, *lidar_resolution)
+                    last_lidar_navrl = (float(args.lidar_max_range) - final_dist).reshape(n, 1, *lidar_resolution)
+                    last_lidar_hit_type_np = tensor_to_np(hit_type.reshape(n, *lidar_resolution), np.uint8)
+                    last_lidar_peer_id_np = tensor_to_np(final_peer_id.reshape(n, *lidar_resolution), np.int16)
+                else:
+                    lidar_frame = rtx_lidar_rig.capture()
+                    last_lidar_range = torch.as_tensor(lidar_frame.range_image, dtype=torch.float32, device=sim.device)
+                    last_lidar_navrl = (float(args.lidar_max_range) - last_lidar_range).unsqueeze(1)
+                    last_lidar_hit_type_np = lidar_frame.hit_type
+                    last_lidar_peer_id_np = lidar_frame.peer_id
+                last_lidar_sample_t = np.float32(sim_t)
+                lidar_is_new = True
+                while next_lidar_t <= sim_t + 1e-9:
+                    next_lidar_t += lidar_period
+
+            if last_lidar_navrl is None:
+                raise RuntimeError("LiDAR frame was not initialized before reward computation.")
 
             navrl_state, _ = compute_navrl_state(root_state, goal_pos, fixed_goal_dirs)
             goal_direction = fixed_goal_dirs.unsqueeze(1)
@@ -1840,13 +1893,20 @@ def main() -> None:
             step_flags = compute_rewards_and_flags(
                 root_state=root_state,
                 goal_pos=goal_pos,
-                lidar_navrl=lidar_navrl.squeeze(1),
+                lidar_navrl=last_lidar_navrl.squeeze(1),
                 lidar_max_range=float(args.lidar_max_range),
                 prev_vel_w=prev_vel_w,
                 height_range=height_range,
                 final_step=(step_idx == total_steps - 1),
             )
-            camera_frame = camera_rig.capture() if camera_rig is not None else None
+
+            camera_is_new = False
+            if camera_rig is not None and (last_camera_frame is None or sim_t + 1e-9 >= next_camera_t or step_idx == total_steps - 1):
+                last_camera_frame = camera_rig.capture()
+                last_camera_sample_t = np.float32(sim_t)
+                camera_is_new = True
+                while next_camera_t <= sim_t + 1e-9:
+                    next_camera_t += camera_period
 
             action = controller(
                 root_state,
@@ -1856,33 +1916,41 @@ def main() -> None:
                 target_yaw=ref_yaw,
             )
 
-            writer.append("episodes/000000/timestamp", np.float32(sim_t))
-            writer.append("episodes/000000/active_mask", tensor_to_np(active_mask, np.bool_))
-            writer.append("episodes/000000/info/root_state", tensor_to_np(root_state, np.float32))
-            writer.append("episodes/000000/info/drone_state", tensor_to_np(root_state[:, :13], np.float32))
-            writer.append("episodes/000000/observations/state", tensor_to_np(navrl_state, np.float32))
-            writer.append("episodes/000000/observations/direction", tensor_to_np(goal_direction, np.float32))
-            writer.append("episodes/000000/observations/lidar", tensor_to_np(lidar_navrl, np.float32))
-            writer.append("episodes/000000/observations/lidar_range", tensor_to_np(lidar_range, np.float32))
-            writer.append("episodes/000000/observations/lidar_hit_type", lidar_hit_type_np)
-            writer.append("episodes/000000/observations/lidar_peer_id", lidar_peer_id_np)
-            if camera_frame is not None:
-                writer.append("episodes/000000/observations/d435_rgb", camera_frame.rgb)
-                writer.append("episodes/000000/observations/d435_depth", camera_frame.depth.astype(np.float32, copy=False))
+            save_due = sim_t + 1e-9 >= next_save_t or step_idx == total_steps - 1
+            if save_due:
+                writer.append("episodes/000000/timestamp", np.float32(sim_t))
+                writer.append("episodes/000000/active_mask", tensor_to_np(active_mask, np.bool_))
+                writer.append("episodes/000000/info/root_state", tensor_to_np(root_state, np.float32))
+                writer.append("episodes/000000/info/drone_state", tensor_to_np(root_state[:, :13], np.float32))
+                writer.append("episodes/000000/observations/state", tensor_to_np(navrl_state, np.float32))
+                writer.append("episodes/000000/observations/direction", tensor_to_np(goal_direction, np.float32))
+                writer.append("episodes/000000/observations/lidar", tensor_to_np(last_lidar_navrl, np.float32))
+                writer.append("episodes/000000/observations/lidar_range", tensor_to_np(last_lidar_range, np.float32))
+                writer.append("episodes/000000/observations/lidar_hit_type", last_lidar_hit_type_np)
+                writer.append("episodes/000000/observations/lidar_peer_id", last_lidar_peer_id_np)
+                writer.append("episodes/000000/observations/lidar_timestamp", np.float32(last_lidar_sample_t))
+                writer.append("episodes/000000/observations/lidar_is_new", np.bool_(lidar_is_new))
+                if last_camera_frame is not None:
+                    writer.append("episodes/000000/observations/d435_rgb", last_camera_frame.rgb)
+                    writer.append("episodes/000000/observations/d435_depth", last_camera_frame.depth.astype(np.float32, copy=False))
+                    writer.append("episodes/000000/observations/d435_timestamp", np.float32(last_camera_sample_t))
+                    writer.append("episodes/000000/observations/d435_is_new", np.bool_(camera_is_new))
 
-            writer.append("episodes/000000/expert/position_ref", tensor_to_np(ref_pos, np.float32))
-            writer.append("episodes/000000/expert/velocity_ref", tensor_to_np(ref_vel, np.float32))
-            writer.append("episodes/000000/expert/acceleration_ref", tensor_to_np(ref_acc, np.float32))
-            writer.append("episodes/000000/expert/yaw_ref", tensor_to_np(ref_yaw, np.float32))
-            writer.append("episodes/000000/expert/action_world", tensor_to_np(ref_vel, np.float32))
-            writer.append("episodes/000000/expert/action_local", tensor_to_np(action_local, np.float32))
+                writer.append("episodes/000000/expert/position_ref", tensor_to_np(ref_pos, np.float32))
+                writer.append("episodes/000000/expert/velocity_ref", tensor_to_np(ref_vel, np.float32))
+                writer.append("episodes/000000/expert/acceleration_ref", tensor_to_np(ref_acc, np.float32))
+                writer.append("episodes/000000/expert/yaw_ref", tensor_to_np(ref_yaw, np.float32))
+                writer.append("episodes/000000/expert/action_world", tensor_to_np(ref_vel, np.float32))
+                writer.append("episodes/000000/expert/action_local", tensor_to_np(action_local, np.float32))
 
-            writer.append("episodes/000000/reward", tensor_to_np(step_flags["reward"], np.float32))
-            writer.append("episodes/000000/collision", tensor_to_np(step_flags["collision"], np.bool_))
-            writer.append("episodes/000000/reach_goal", tensor_to_np(step_flags["reach_goal"], np.bool_))
-            writer.append("episodes/000000/terminated", tensor_to_np(step_flags["terminated"], np.bool_))
-            writer.append("episodes/000000/truncated", tensor_to_np(step_flags["truncated"], np.bool_))
-            writer.append("episodes/000000/done", tensor_to_np(step_flags["done"], np.bool_))
+                writer.append("episodes/000000/reward", tensor_to_np(step_flags["reward"], np.float32))
+                writer.append("episodes/000000/collision", tensor_to_np(step_flags["collision"], np.bool_))
+                writer.append("episodes/000000/reach_goal", tensor_to_np(step_flags["reach_goal"], np.bool_))
+                writer.append("episodes/000000/terminated", tensor_to_np(step_flags["terminated"], np.bool_))
+                writer.append("episodes/000000/truncated", tensor_to_np(step_flags["truncated"], np.bool_))
+                writer.append("episodes/000000/done", tensor_to_np(step_flags["done"], np.bool_))
+                while next_save_t <= sim_t + 1e-9:
+                    next_save_t += save_period
 
             prev_vel_w = root_state[:, 7:10].clone()
             drone.apply_action(action)
