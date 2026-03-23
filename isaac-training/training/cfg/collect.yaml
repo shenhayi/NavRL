@@ -12,8 +12,8 @@ viewer:
 collect:
   # Replace with your scenario_data.json path.
   json: /abs/path/to/scenario_data.json
-  # Optional explicit output path. Defaults to <json stem>.h5 when left empty.
-  output:
+  # Optional output file or directory. If a directory is given, the collector writes <json stem>.h5 inside it.
+  output: /home/haoyus/projects/NavRL/NavRL-code/NavRL/output/h5
   headless: true
   anti_aliasing: 4
   drone_model: Hummingbird

@@ -237,9 +237,19 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.json is None:
         parser.error("Scenario JSON path is required. Pass --json or set collect.json/json in --config.")
+
+    json_path = Path(args.json).expanduser().resolve()
     if args.output is None:
-        json_path = Path(args.json).expanduser().resolve()
-        args.output = str(json_path.with_suffix(".h5"))
+        output_path = json_path.with_suffix(".h5")
+    else:
+        output_path = Path(args.output).expanduser()
+        suffix = output_path.suffix.lower()
+        treat_as_directory = (output_path.exists() and output_path.is_dir()) or suffix not in (".h5", ".hdf5")
+        if treat_as_directory:
+            output_path = output_path / f"{json_path.stem}.h5"
+        output_path = output_path.resolve()
+    args.output = str(output_path)
+
     if len(args.lidar_offset) != 3:
         parser.error("--lidar-offset must have exactly 3 values.")
     if len(args.peer_box_size) != 3:

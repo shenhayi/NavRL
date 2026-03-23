@@ -109,3 +109,7 @@ isaac-training/training/scripts/outputs/
 isaac-training/third_party/warp/_build/
 
 isaac-training/outputs/
+# Generated collection outputs
+/output/h5/*
+!/output/h5/.gitkeep
+
