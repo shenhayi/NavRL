@@ -28,6 +28,7 @@ import datetime
 import json
 import math
 import os
+import shutil
 import sys
 import traceback
 from dataclasses import dataclass
@@ -46,6 +47,37 @@ OMNIDRONES_DIR = THIRD_PARTY_DIR / "OmniDrones"
 ORBIT_SOURCE_DIR = THIRD_PARTY_DIR / "orbit" / "source"
 REPO_ROOT = ISAAC_TRAINING_DIR.parents[2]
 ISAAC_SIM_DIR = REPO_ROOT / "isaac-sim"
+
+
+def iter_isaac_sim_dirs() -> list[Path]:
+    candidates: list[Path] = []
+
+    for env_name in ("ISAAC_SIM_PATH",):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            candidates.append(Path(env_value).expanduser().resolve())
+
+    exp_path = os.environ.get("EXP_PATH")
+    if exp_path:
+        candidates.append(Path(exp_path).expanduser().resolve().parent)
+
+    for seed in (Path(sys.executable).resolve(), SCRIPT_DIR.resolve(), ISAAC_SIM_DIR.resolve()):
+        candidates.extend(seed.parents)
+
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            candidate = candidate.resolve()
+        except FileNotFoundError:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if (candidate / "exts" / "omni.isaac.sensor" / "data" / "lidar_configs").is_dir():
+            resolved.append(candidate)
+    return resolved
+
 
 for path in (SCRIPT_DIR, TRAINING_DIR, OMNIDRONES_DIR):
     path_str = str(path)
@@ -253,6 +285,13 @@ def parse_args() -> argparse.Namespace:
             output_path = output_path / f"{json_path.stem}.h5"
         output_path = output_path.resolve()
     args.output = str(output_path)
+
+    if args.rtx_lidar_config:
+        rtx_config_path = Path(args.rtx_lidar_config).expanduser()
+        if not rtx_config_path.is_absolute() and args.config:
+            candidate = Path(args.config).expanduser().resolve().parent / rtx_config_path
+            if candidate.is_file():
+                args.rtx_lidar_config = str(candidate)
 
     if len(args.lidar_offset) != 3:
         parser.error("--lidar-offset must have exactly 3 values.")
@@ -572,7 +611,27 @@ def apply_scenario_sensor_defaults(args: argparse.Namespace, scenario: dict) -> 
 
 
 def get_rtx_lidar_config_root() -> Path:
-    return ISAAC_SIM_DIR / "exts" / "omni.isaac.sensor" / "data" / "lidar_configs"
+    candidates = iter_isaac_sim_dirs()
+    if not candidates:
+        raise FileNotFoundError(
+            "Could not locate an Isaac Sim install with exts/omni.isaac.sensor/data/lidar_configs. "
+            "Set ISAAC_SIM_PATH or launch via isaac-sim/python.sh so EXP_PATH is available."
+        )
+    return candidates[0] / "exts" / "omni.isaac.sensor" / "data" / "lidar_configs"
+
+
+def install_rtx_lidar_config_if_needed(config_name: str) -> str:
+    candidate = Path(config_name).expanduser()
+    if not candidate.is_file():
+        return Path(config_name).stem
+
+    config_root = get_rtx_lidar_config_root()
+    config_root.mkdir(parents=True, exist_ok=True)
+    target_path = config_root / candidate.name
+    if not target_path.exists() or target_path.read_bytes() != candidate.read_bytes():
+        shutil.copy2(candidate, target_path)
+        print(f"Installed RTX lidar config to {target_path}")
+    return target_path.stem
 
 
 def resolve_rtx_lidar_config_path(config_name: str) -> Path:
@@ -1377,6 +1436,7 @@ def main() -> None:
             enable_extension("omni.replicator.isaac")
             import omni.replicator.core as rep
         if args.lidar_backend == "rtx":
+            args.rtx_lidar_config = install_rtx_lidar_config_if_needed(args.rtx_lidar_config)
             enable_extension("omni.isaac.sensor")
 
         if args.lidar_backend == "raycast":

@@ -26,7 +26,7 @@ collect:
 
   # LiDAR
   lidar_backend: rtx
-  rtx_lidar_config: MID360_40ch20hz1024res
+  rtx_lidar_config: rtx_lidar/MID360_40ch20hz1024res.json
   lidar_hres: 1.0
   lidar_vbeams: 40
   # Leave these null to follow the scenario JSON sensor metadata.
