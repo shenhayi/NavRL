@@ -82,6 +82,7 @@ DEFAULT_ARGS = {
     "lidar_attach_yaw_only": False,
     "lidar_offset": (0.0, 0.0, 0.0),
     "peer_box_size": (0.12, 0.12, 0.16),
+    "camera_enabled": True,
     "camera_resolution": (640, 480),
     "camera_offset": (0.08, 0.0, 0.0),
     "camera_target": (1.08, 0.0, 0.0),
@@ -154,6 +155,7 @@ def config_arg_defaults(config: dict) -> dict:
         "lidar_attach_yaw_only": collect_cfg.get("lidar_attach_yaw_only"),
         "lidar_offset": collect_cfg.get("lidar_offset"),
         "peer_box_size": collect_cfg.get("peer_box_size"),
+        "camera_enabled": collect_cfg.get("camera_enabled"),
         "camera_resolution": collect_cfg.get("camera_resolution"),
         "camera_offset": collect_cfg.get("camera_offset"),
         "camera_target": collect_cfg.get("camera_target"),
@@ -208,6 +210,7 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--lidar-offset", nargs=3, type=float, default=defaults["lidar_offset"], help="LiDAR translation offset from base_link")
     parser.add_argument("--peer-box-size", nargs=3, type=float, default=defaults["peer_box_size"], help="Peer-drone OBB size used for LiDAR overlay")
 
+    parser.add_argument("--camera-enabled", action=argparse.BooleanOptionalAction, default=defaults["camera_enabled"], help="Enable onboard D435 capture via Replicator")
     parser.add_argument("--camera-resolution", nargs=2, type=int, default=defaults["camera_resolution"], help="D435-style camera resolution")
     parser.add_argument("--camera-offset", nargs=3, type=float, default=defaults["camera_offset"], help="Camera translation offset from base_link")
     parser.add_argument("--camera-target", nargs=3, type=float, default=defaults["camera_target"], help="Camera look-at target in the camera parent frame")
@@ -1323,13 +1326,17 @@ def main() -> None:
 
     app_experience = None
     if "EXP_PATH" in os.environ:
-        app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.kit"
+        if args.headless:
+            app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.gym.headless.kit"
+        else:
+            app_experience = f"{os.environ['EXP_PATH']}/omni.isaac.sim.python.kit"
 
     simulation_app = (
         SimulationApp({"headless": args.headless, "anti_aliasing": args.anti_aliasing}, experience=app_experience)
         if app_experience
         else SimulationApp({"headless": args.headless, "anti_aliasing": args.anti_aliasing})
     )
+    print(f"SimulationApp experience: {app_experience or 'default'}")
 
     writer = None
     try:
@@ -1355,10 +1362,12 @@ def main() -> None:
         else:
             set_camera_view = None
 
-        enable_extension("omni.replicator.isaac")
+        rep = None
+        if args.camera_enabled:
+            enable_extension("omni.replicator.isaac")
+            import omni.replicator.core as rep
         if args.lidar_backend == "rtx":
             enable_extension("omni.isaac.sensor")
-        import omni.replicator.core as rep
 
         if args.lidar_backend == "raycast":
             from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
@@ -1558,6 +1567,7 @@ def main() -> None:
                 raise RuntimeError("RTX lidar backend requires --rtx-lidar-config or a matching scenario sensor.model default.")
             lidar = None
             lidar_paths = [f"/World/envs/env_0/{drone.name}_{i}/base_link/mid360_lidar" for i in range(n)]
+            print(f"Initializing RTX lidar rig with config {Path(args.rtx_lidar_config).stem}...")
             rtx_lidar_rig = RtxLidarRig(
                 config_name=args.rtx_lidar_config,
                 offset=tuple(float(v) for v in args.lidar_offset),
@@ -1565,19 +1575,24 @@ def main() -> None:
                 range_limits=(float(args.lidar_min_range), float(args.lidar_max_range)),
             )
             rtx_lidar_rig.spawn(lidar_paths, LidarRtx)
+            print("RTX lidar rig spawned.")
 
-        camera_paths = [f"/World/envs/env_0/{drone.name}_{i}/base_link/D435" for i in range(n)]
-        camera_rig = D435CameraRig(
-            resolution=tuple(args.camera_resolution),
-            offset=tuple(float(v) for v in args.camera_offset),
-            target=tuple(float(v) for v in args.camera_target),
-            focal_length=float(args.camera_focal_length),
-            focus_distance=float(args.camera_focus_distance),
-            horizontal_aperture=float(args.camera_horizontal_aperture),
-            clip_range=tuple(float(v) for v in args.camera_clip_range),
-        )
-        camera_rig.spawn(camera_paths)
-        camera_rig.initialize(rep, sim)
+        camera_rig = None
+        if args.camera_enabled:
+            print("Initializing D435 camera rig...")
+            camera_paths = [f"/World/envs/env_0/{drone.name}_{i}/base_link/D435" for i in range(n)]
+            camera_rig = D435CameraRig(
+                resolution=tuple(args.camera_resolution),
+                offset=tuple(float(v) for v in args.camera_offset),
+                target=tuple(float(v) for v in args.camera_target),
+                focal_length=float(args.camera_focal_length),
+                focus_distance=float(args.camera_focus_distance),
+                horizontal_aperture=float(args.camera_horizontal_aperture),
+                clip_range=tuple(float(v) for v in args.camera_clip_range),
+            )
+            camera_rig.spawn(camera_paths)
+            camera_rig.initialize(rep, sim)
+            print("D435 camera rig ready.")
 
         controller = LeePositionController(g=9.81, uav_params=drone.params).to(sim.device)
 
@@ -1626,12 +1641,15 @@ def main() -> None:
             + f" range=({args.lidar_min_range:.2f}, {args.lidar_max_range:.2f})"
             + f" tilt={args.lidar_forward_tilt_deg:.2f}deg"
         )
-        print(
-            "Camera:"
-            f" model=D435"
-            f" resolution={args.camera_resolution[0]}x{args.camera_resolution[1]}"
-            f" focal_length={args.camera_focal_length:.2f}mm"
-        )
+        if args.camera_enabled:
+            print(
+                "Camera:"
+                f" model=D435"
+                f" resolution={args.camera_resolution[0]}x{args.camera_resolution[1]}"
+                f" focal_length={args.camera_focal_length:.2f}mm"
+            )
+        else:
+            print("Camera: disabled")
 
         sim.play()
         sim.render()
@@ -1733,7 +1751,7 @@ def main() -> None:
                 height_range=height_range,
                 final_step=(step_idx == total_steps - 1),
             )
-            camera_frame = camera_rig.capture()
+            camera_frame = camera_rig.capture() if camera_rig is not None else None
 
             action = controller(
                 root_state,
@@ -1753,8 +1771,9 @@ def main() -> None:
             writer.append("episodes/000000/observations/lidar_range", tensor_to_np(lidar_range, np.float32))
             writer.append("episodes/000000/observations/lidar_hit_type", lidar_hit_type_np)
             writer.append("episodes/000000/observations/lidar_peer_id", lidar_peer_id_np)
-            writer.append("episodes/000000/observations/d435_rgb", camera_frame.rgb)
-            writer.append("episodes/000000/observations/d435_depth", camera_frame.depth.astype(np.float32, copy=False))
+            if camera_frame is not None:
+                writer.append("episodes/000000/observations/d435_rgb", camera_frame.rgb)
+                writer.append("episodes/000000/observations/d435_depth", camera_frame.depth.astype(np.float32, copy=False))
 
             writer.append("episodes/000000/expert/position_ref", tensor_to_np(ref_pos, np.float32))
             writer.append("episodes/000000/expert/velocity_ref", tensor_to_np(ref_vel, np.float32))
