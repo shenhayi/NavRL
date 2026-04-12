@@ -117,6 +117,18 @@ def summarize_terminal_flags(episode) -> None:
         print(f"{name}: any={any_hits.tolist()} final={final_hits.tolist()}")
 
 
+def summarize_supervision(episode) -> None:
+    if "supervision_label" in episode:
+        print(f"supervision_label: {np.asarray(episode['supervision_label']).tolist()}")
+    if "failure_reason" in episode:
+        reasons = [value.decode('utf-8') if isinstance(value, bytes) else str(value) for value in episode["failure_reason"][()]]
+        print(f"failure_reason: {reasons}")
+    if "failure_severity" in episode:
+        print(f"failure_severity: {np.asarray(episode['failure_severity']).tolist()}")
+    if "failure_learnable" in episode:
+        print(f"failure_learnable: {np.asarray(episode['failure_learnable']).astype(bool).tolist()}")
+
+
 def summarize_numeric_dataset(episode, path: str) -> None:
     if path not in episode:
         print(f"{path}: missing")
@@ -156,13 +168,13 @@ def summarize_episode(file_handle, episode_name: str) -> None:
 
     summarize_timestamps(episode)
     summarize_active_mask(episode)
+    summarize_supervision(episode)
     summarize_terminal_flags(episode)
 
     default_stats = [
         "reward",
         "observations/lidar_range",
         "observations/lidar",
-        "observations/d435_depth",
         "expert/action_local",
         "expert/action_world",
         "info/root_state",

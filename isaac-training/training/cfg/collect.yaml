@@ -23,9 +23,8 @@ collect:
   save_stage:
   compression: lzf
   store_global_cloud: false
-  save_hz: 30.0
+  save_hz: 10.0
   lidar_hz: 10.0
-  camera_hz: 30.0
 
   # LiDAR
   lidar_backend: rtx
@@ -44,7 +43,7 @@ collect:
   peer_box_size: [0.12, 0.12, 0.16]
 
   # Camera
-  camera_enabled: true
+  camera_enabled: false
   camera_resolution: [640, 480]
   camera_offset: [0.08, 0.0, 0.0]
   camera_target: [1.08, 0.0, 0.0]

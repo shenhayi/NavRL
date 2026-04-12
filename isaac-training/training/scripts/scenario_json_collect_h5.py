@@ -9,9 +9,8 @@ This mirrors the existing scenario_json_replay.py flow:
 
 On top of replay, it writes a synchronized H5 file containing:
 - per-drone expert references
-- per-drone onboard D435-style RGB-D images
 - per-drone Mid360-style LiDAR
-- swarm states and replay outcomes
+- swarm states, replay outcomes, and trajectory supervision labels
 
 LiDAR collection supports two backends:
 - RTX LiDAR via omni.isaac.sensor LidarRtx and a custom Mid360 profile
@@ -104,9 +103,8 @@ DEFAULT_ARGS = {
     "device": None,
     "compression": "lzf",
     "store_global_cloud": False,
-    "save_hz": 30.0,
+    "save_hz": 10.0,
     "lidar_hz": 10.0,
-    "camera_hz": 30.0,
     "lidar_backend": "rtx",
     "rtx_lidar_config": None,
     "lidar_hres": 1.0,
@@ -119,7 +117,7 @@ DEFAULT_ARGS = {
     "lidar_attach_yaw_only": False,
     "lidar_offset": (0.0, 0.0, 0.0),
     "peer_box_size": (0.12, 0.12, 0.16),
-    "camera_enabled": True,
+    "camera_enabled": False,
     "camera_resolution": (640, 480),
     "camera_offset": (0.08, 0.0, 0.0),
     "camera_target": (1.08, 0.0, 0.0),
@@ -182,7 +180,6 @@ def config_arg_defaults(config: dict) -> dict:
         "store_global_cloud": collect_cfg.get("store_global_cloud"),
         "save_hz": collect_cfg.get("save_hz"),
         "lidar_hz": collect_cfg.get("lidar_hz"),
-        "camera_hz": collect_cfg.get("camera_hz"),
         "lidar_backend": collect_cfg.get("lidar_backend"),
         "rtx_lidar_config": collect_cfg.get("rtx_lidar_config"),
         "lidar_hres": collect_cfg.get("lidar_hres"),
@@ -195,7 +192,6 @@ def config_arg_defaults(config: dict) -> dict:
         "lidar_attach_yaw_only": collect_cfg.get("lidar_attach_yaw_only"),
         "lidar_offset": collect_cfg.get("lidar_offset"),
         "peer_box_size": collect_cfg.get("peer_box_size"),
-        "camera_enabled": collect_cfg.get("camera_enabled"),
         "camera_resolution": collect_cfg.get("camera_resolution"),
         "camera_offset": collect_cfg.get("camera_offset"),
         "camera_target": collect_cfg.get("camera_target"),
@@ -238,7 +234,6 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--store-global-cloud", action=argparse.BooleanOptionalAction, default=defaults["store_global_cloud"], help="Store scenario.global_cloud_world once in the H5")
     parser.add_argument("--save-hz", type=float, default=defaults["save_hz"], help="Dataset write frequency in Hz")
     parser.add_argument("--lidar-hz", type=float, default=defaults["lidar_hz"], help="LiDAR refresh frequency in Hz")
-    parser.add_argument("--camera-hz", type=float, default=defaults["camera_hz"], help="Camera refresh frequency in Hz")
 
     parser.add_argument("--lidar-backend", type=str, default=defaults["lidar_backend"], choices=("rtx", "raycast"), help="LiDAR backend used for collection")
     parser.add_argument("--rtx-lidar-config", type=str, default=defaults["rtx_lidar_config"], help="RTX LiDAR config name or .json path resolved from Isaac Sim lidar_configs")
@@ -253,7 +248,7 @@ def build_parser(defaults: dict) -> argparse.ArgumentParser:
     parser.add_argument("--lidar-offset", nargs=3, type=float, default=defaults["lidar_offset"], help="LiDAR translation offset from base_link")
     parser.add_argument("--peer-box-size", nargs=3, type=float, default=defaults["peer_box_size"], help="Peer-drone OBB size used for LiDAR overlay")
 
-    parser.add_argument("--camera-enabled", action=argparse.BooleanOptionalAction, default=defaults["camera_enabled"], help="Enable onboard D435 capture via Replicator")
+    parser.add_argument("--camera-enabled", action=argparse.BooleanOptionalAction, default=defaults["camera_enabled"], help="Deprecated. Camera capture is disabled and no camera data is written.")
     parser.add_argument("--camera-resolution", nargs=2, type=int, default=defaults["camera_resolution"], help="D435-style camera resolution")
     parser.add_argument("--camera-offset", nargs=3, type=float, default=defaults["camera_offset"], help="Camera translation offset from base_link")
     parser.add_argument("--camera-target", nargs=3, type=float, default=defaults["camera_target"], help="Camera look-at target in the camera parent frame")
@@ -329,14 +324,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--save-hz must be positive.")
     if args.lidar_hz <= 0.0:
         parser.error("--lidar-hz must be positive.")
-    if args.camera_hz <= 0.0:
-        parser.error("--camera-hz must be positive.")
     if args.save_hz > sim_hz + 1e-6:
         parser.error(f"--save-hz must be <= simulation rate ({sim_hz:.3f} Hz).")
     if args.lidar_hz > sim_hz + 1e-6:
         parser.error(f"--lidar-hz must be <= simulation rate ({sim_hz:.3f} Hz).")
-    if args.camera_hz > sim_hz + 1e-6:
-        parser.error(f"--camera-hz must be <= simulation rate ({sim_hz:.3f} Hz).")
     return args
 
 
@@ -485,6 +476,69 @@ def infer_accelerations(traj: dict, velocities: np.ndarray, timestamps: np.ndarr
     return acc
 
 
+# Heuristic supervision labels derived from planner-side annotations.
+# Positive expert paths use label=1, learnable failures use label=-1, and
+# unlabeled/ambiguous cases use label=0 so training can ignore them.
+FAILURE_REASON_CODES = {
+    "none": 0,
+    "success": 0,
+    "unknown": 1,
+    "collision": 2,
+    "obstacle_collision": 3,
+    "drone_collision": 4,
+    "drone_drone_collision": 4,
+    "drone_drone_clearance": 5,
+    "drone_obstacle_collision": 6,
+    "obstacle_clearance": 7,
+    "unfinished": 8,
+    "partial": 9,
+    "timeout": 10,
+}
+
+
+def normalize_failure_reason(reason: Any) -> str:
+    if reason is None:
+        return "none"
+    text = str(reason).strip().lower()
+    if not text:
+        return "none"
+    return text
+
+
+def failure_reason_code(reason: str) -> int:
+    if reason in FAILURE_REASON_CODES:
+        return FAILURE_REASON_CODES[reason]
+    return FAILURE_REASON_CODES["unknown"]
+
+
+def estimate_failure_severity(reason: str, is_valid: bool) -> float:
+    if is_valid or reason in {"none", "success"}:
+        return 0.0
+    if "collision" in reason:
+        return 1.0
+    if "clearance" in reason:
+        return 0.7
+    if "unfinished" in reason or "timeout" in reason:
+        return 0.4
+    return 0.5
+
+
+def is_failure_learnable(reason: str, is_valid: bool) -> bool:
+    if is_valid:
+        return True
+    if reason in {"none", "success"}:
+        return False
+    return any(token in reason for token in ("collision", "clearance", "unfinished", "timeout"))
+
+
+def supervision_label(is_valid: bool, reason: str) -> int:
+    if is_valid:
+        return 1
+    if is_failure_learnable(reason, is_valid):
+        return -1
+    return 0
+
+
 def extract_track_data(scenario: dict) -> tuple[list[dict], list[tuple[float, float, float]], list[float]]:
     start_positions = []
     track_data = []
@@ -510,6 +564,9 @@ def extract_track_data(scenario: dict) -> tuple[list[dict], list[tuple[float, fl
         goal = np.asarray(drone_data.get("goal", positions[-1]), dtype=float)
         fallback_yaw = quat_wxyz_to_yaw(initial_orientation, 0.0)
         init_yaw = yaw_from_velocity(velocities[0], fallback_yaw)
+        is_valid = bool(drone_data.get("valid", True))
+        failure_reason = normalize_failure_reason(drone_data.get("failure_reason", traj.get("failure_reason")))
+        learnable = is_failure_learnable(failure_reason, is_valid)
 
         start_positions.append(tuple(positions[0].tolist()))
         init_yaws.append(init_yaw)
@@ -524,6 +581,12 @@ def extract_track_data(scenario: dict) -> tuple[list[dict], list[tuple[float, fl
                 "start": positions[0].copy(),
                 "initial_orientation_wxyz": initial_orientation,
                 "fallback_yaw": init_yaw,
+                "is_valid": is_valid,
+                "failure_reason": failure_reason,
+                "failure_reason_code": failure_reason_code(failure_reason),
+                "failure_severity": estimate_failure_severity(failure_reason, is_valid),
+                "learnable": learnable,
+                "supervision_label": supervision_label(is_valid, failure_reason),
             }
         )
 
@@ -1177,12 +1240,11 @@ class SwarmH5Writer:
         ray_dirs_local: np.ndarray,
     ) -> None:
         root = self.file
-        root.attrs["dataset_version"] = "swarm_collect_v1"
+        root.attrs["dataset_version"] = "swarm_collect_v2"
         root.attrs["source_json"] = str(scenario_path)
         root.attrs["sim_dt"] = float(args.sim_dt)
         root.attrs["save_hz"] = float(args.save_hz)
         root.attrs["lidar_hz"] = float(args.lidar_hz)
-        root.attrs["camera_hz"] = float(args.camera_hz)
         root.attrs["num_drones"] = len(track_data)
         root.attrs["num_obstacles"] = len(obstacles)
         root.attrs["compression"] = "none" if self.compression is None else self.compression
@@ -1195,8 +1257,14 @@ class SwarmH5Writer:
         root.attrs["lidar_min_range"] = float(args.lidar_min_range)
         root.attrs["lidar_max_range"] = float(args.lidar_max_range)
         root.attrs["lidar_forward_tilt_deg"] = float(args.lidar_forward_tilt_deg)
-        root.attrs["camera_model"] = "D435"
-        root.attrs["camera_resolution"] = np.asarray(args.camera_resolution, dtype=np.int32)
+        metadata = scenario.get("metadata") or {}
+        root.attrs["scenario_success"] = bool(metadata.get("success", True))
+        root.attrs["all_trajectories_valid"] = bool(metadata.get("all_trajectories_valid", True))
+        root.attrs["valid_trajectory_count"] = int(metadata.get("valid_trajectory_count", len(track_data)))
+        root.attrs["invalid_trajectory_count"] = int(metadata.get("invalid_trajectory_count", 0))
+        root.attrs["primary_failure_reason"] = str(metadata.get("primary_failure_reason", "none"))
+        root.attrs["primary_failure_drone_id"] = int(metadata.get("primary_failure_drone_id", -1))
+        root.attrs["supervision_label_semantics"] = "-1=learnable_failure,0=ignore,1=expert_positive"
 
         scenario_group = root.require_group("scenario")
         obstacle_centers = np.asarray([[obs["x"], obs["y"], obs["z"]] for obs in obstacles], dtype=np.float32)
@@ -1216,8 +1284,6 @@ class SwarmH5Writer:
         sensors_group.create_dataset("lidar_ray_directions_local", data=ray_dirs_local.astype(np.float32))
         sensors_group.create_dataset("peer_box_size", data=np.asarray(args.peer_box_size, dtype=np.float32))
         sensors_group.create_dataset("lidar_offset", data=np.asarray(args.lidar_offset, dtype=np.float32))
-        sensors_group.create_dataset("camera_offset", data=np.asarray(args.camera_offset, dtype=np.float32))
-        sensors_group.create_dataset("camera_target", data=np.asarray(args.camera_target, dtype=np.float32))
 
         episode = root.require_group("episodes/000000")
         episode.attrs["num_drones"] = len(track_data)
@@ -1231,6 +1297,17 @@ class SwarmH5Writer:
         episode.create_dataset(
             "track_end_time",
             data=np.asarray([track["timestamps"][-1] for track in track_data], dtype=np.float32),
+        )
+        episode.create_dataset("trajectory_valid", data=np.asarray([track["is_valid"] for track in track_data], dtype=np.bool_))
+        episode.create_dataset("failure_reason_code", data=np.asarray([track["failure_reason_code"] for track in track_data], dtype=np.int16))
+        episode.create_dataset("failure_severity", data=np.asarray([track["failure_severity"] for track in track_data], dtype=np.float32))
+        episode.create_dataset("failure_learnable", data=np.asarray([track["learnable"] for track in track_data], dtype=np.bool_))
+        episode.create_dataset("supervision_label", data=np.asarray([track["supervision_label"] for track in track_data], dtype=np.int8))
+        string_dtype = self.h5py.string_dtype(encoding="utf-8")
+        episode.create_dataset(
+            "failure_reason",
+            data=np.asarray([track["failure_reason"] for track in track_data], dtype=string_dtype),
+            dtype=string_dtype,
         )
 
     def _ensure_dataset(self, name: str, sample: np.ndarray):
@@ -1485,10 +1562,6 @@ def main() -> None:
         else:
             set_camera_view = None
 
-        rep = None
-        if args.camera_enabled:
-            enable_extension("omni.replicator.isaac")
-            import omni.replicator.core as rep
         if args.lidar_backend == "rtx":
             args.rtx_lidar_config = install_rtx_lidar_config_if_needed(args.rtx_lidar_config)
             enable_extension("omni.isaac.sensor")
@@ -1701,23 +1774,6 @@ def main() -> None:
             rtx_lidar_rig.spawn(lidar_paths, LidarRtx)
             print("RTX lidar rig spawned.")
 
-        camera_rig = None
-        if args.camera_enabled:
-            print("Initializing D435 camera rig...")
-            camera_paths = [f"/World/envs/env_0/{drone.name}_{i}/base_link/D435" for i in range(n)]
-            camera_rig = D435CameraRig(
-                resolution=tuple(args.camera_resolution),
-                offset=tuple(float(v) for v in args.camera_offset),
-                target=tuple(float(v) for v in args.camera_target),
-                focal_length=float(args.camera_focal_length),
-                focus_distance=float(args.camera_focus_distance),
-                horizontal_aperture=float(args.camera_horizontal_aperture),
-                clip_range=tuple(float(v) for v in args.camera_clip_range),
-            )
-            camera_rig.spawn(camera_paths)
-            camera_rig.initialize(rep, sim)
-            print("D435 camera rig ready.")
-
         controller = LeePositionController(g=9.81, uav_params=drone.params).to(sim.device)
 
         viewer_eye, viewer_target = compute_viewer_camera_pose(obstacles, track_data)
@@ -1765,15 +1821,7 @@ def main() -> None:
             + f" range=({args.lidar_min_range:.2f}, {args.lidar_max_range:.2f})"
             + f" tilt={args.lidar_forward_tilt_deg:.2f}deg"
         )
-        if args.camera_enabled:
-            print(
-                "Camera:"
-                f" model=D435"
-                f" resolution={args.camera_resolution[0]}x{args.camera_resolution[1]}"
-                f" focal_length={args.camera_focal_length:.2f}mm"
-            )
-        else:
-            print("Camera: disabled")
+        print("Camera: disabled")
 
         sim.play()
         sim.render()
@@ -1797,17 +1845,13 @@ def main() -> None:
 
         save_period = 1.0 / float(args.save_hz)
         lidar_period = 1.0 / float(args.lidar_hz)
-        camera_period = 1.0 / float(args.camera_hz)
         next_save_t = 0.0
         next_lidar_t = 0.0
-        next_camera_t = 0.0
         last_lidar_range = None
         last_lidar_navrl = None
         last_lidar_hit_type_np = None
         last_lidar_peer_id_np = None
         last_lidar_sample_t = np.float32(0.0)
-        last_camera_frame = None
-        last_camera_sample_t = np.float32(0.0)
 
         for step_idx in range(total_steps):
             if not simulation_app.is_running():
@@ -1900,14 +1944,6 @@ def main() -> None:
                 final_step=(step_idx == total_steps - 1),
             )
 
-            camera_is_new = False
-            if camera_rig is not None and (last_camera_frame is None or sim_t + 1e-9 >= next_camera_t or step_idx == total_steps - 1):
-                last_camera_frame = camera_rig.capture()
-                last_camera_sample_t = np.float32(sim_t)
-                camera_is_new = True
-                while next_camera_t <= sim_t + 1e-9:
-                    next_camera_t += camera_period
-
             action = controller(
                 root_state,
                 target_pos=ref_pos,
@@ -1930,11 +1966,6 @@ def main() -> None:
                 writer.append("episodes/000000/observations/lidar_peer_id", last_lidar_peer_id_np)
                 writer.append("episodes/000000/observations/lidar_timestamp", np.float32(last_lidar_sample_t))
                 writer.append("episodes/000000/observations/lidar_is_new", np.bool_(lidar_is_new))
-                if last_camera_frame is not None:
-                    writer.append("episodes/000000/observations/d435_rgb", last_camera_frame.rgb)
-                    writer.append("episodes/000000/observations/d435_depth", last_camera_frame.depth.astype(np.float32, copy=False))
-                    writer.append("episodes/000000/observations/d435_timestamp", np.float32(last_camera_sample_t))
-                    writer.append("episodes/000000/observations/d435_is_new", np.bool_(camera_is_new))
 
                 writer.append("episodes/000000/expert/position_ref", tensor_to_np(ref_pos, np.float32))
                 writer.append("episodes/000000/expert/velocity_ref", tensor_to_np(ref_vel, np.float32))
@@ -1942,6 +1973,26 @@ def main() -> None:
                 writer.append("episodes/000000/expert/yaw_ref", tensor_to_np(ref_yaw, np.float32))
                 writer.append("episodes/000000/expert/action_world", tensor_to_np(ref_vel, np.float32))
                 writer.append("episodes/000000/expert/action_local", tensor_to_np(action_local, np.float32))
+                writer.append(
+                    "episodes/000000/supervision/trajectory_valid",
+                    np.asarray([track["is_valid"] for track in track_data], dtype=np.bool_),
+                )
+                writer.append(
+                    "episodes/000000/supervision/failure_reason_code",
+                    np.asarray([track["failure_reason_code"] for track in track_data], dtype=np.int16),
+                )
+                writer.append(
+                    "episodes/000000/supervision/failure_severity",
+                    np.asarray([track["failure_severity"] for track in track_data], dtype=np.float32),
+                )
+                writer.append(
+                    "episodes/000000/supervision/failure_learnable",
+                    np.asarray([track["learnable"] for track in track_data], dtype=np.bool_),
+                )
+                writer.append(
+                    "episodes/000000/supervision/label",
+                    np.asarray([track["supervision_label"] for track in track_data], dtype=np.int8),
+                )
 
                 writer.append("episodes/000000/reward", tensor_to_np(step_flags["reward"], np.float32))
                 writer.append("episodes/000000/collision", tensor_to_np(step_flags["collision"], np.bool_))

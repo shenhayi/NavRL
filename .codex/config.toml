@@ -1,0 +1,37 @@
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+web_search = "live"
+
+[features]
+use_legacy_landlock = true
+
+[sandbox_workspace_write]
+network_access = true
+
+[env]
+WORKSPACE_ROOT = "~/projects/NavRL/NavRL-code/NavRL"
+STATE_FILE = "session_state.md"
+
+[agents.explorer]
+description = "Context-gathering agent that indexes the codebase into a persistent state file."
+config_file = "agents/explorer.toml"
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+
+[agents.planner]
+description = "Strategic agent that designs implementation steps based on the state file."
+config_file = "agents/planner.toml"
+model = "gpt-5.4"
+model_reasoning_effort = "high"
+
+[agents.test-writer]
+description = "Execution agent that applies changes and updates progress in the state file."
+config_file = "agents/test-writer.toml"
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+
+[agents.reviewer]
+description = "Final validation agent that ensures code safety and logical correctness."
+config_file = "agents/reviewer.toml"
+model = "gpt-5.4"
+model_reasoning_effort = "high"
